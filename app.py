@@ -105,12 +105,36 @@ class Job:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
+    def __post_init__(self):
+        object.__setattr__(self, "_stage_timer", 0.0)
+        object.__setattr__(self, "stage_times", [])
+
+    def _stage_begin(self) -> None:
+        object.__setattr__(self, "_stage_timer", time.time())
+
+    def _stage_end(self, label: str) -> float:
+        elapsed = time.time() - self._stage_timer
+        self.stage_times.append((label, elapsed))
+        return elapsed
+
     def log(self, message: str, progress: int | None = None) -> None:
         self.logs.append(message)
         self.stage = message
         if progress is not None:
             self.progress = progress
         self.updated_at = time.time()
+
+    def build_summary(self) -> str:
+        lines = ["═══ 任务汇总 ═══"]
+        for label, elapsed in self.stage_times:
+            lines.append(f"  {label}：{elapsed:.1f}s")
+        total = time.time() - self.created_at
+        lines.append(f"  总耗时：{total:.1f}s")
+        if self.output_dir:
+            lines.append(f"  输出目录：{self.output_dir}")
+            lines.append(f"    transcript.txt")
+            lines.append(f"    article.md")
+        return "\n".join(lines)
 
 
 jobs: dict[str, Job] = {}
@@ -742,7 +766,9 @@ def process_job(job: Job) -> None:
             job.log(f"复用缓存: {cached}", 100)
             return
 
+        job._stage_begin()
         view_data, headers = fetch_bilibili_view(job.url, job)
+        job._stage_end("获取视频信息")
         title = view_data.get("data", {}).get("title") or bvid
         dir_name = f"{time.strftime('%Y%m%d')}-{bvid}-{sanitize_filename(title)}"
         OUTPUT_DIR.mkdir(exist_ok=True)
@@ -750,10 +776,14 @@ def process_job(job: Job) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         job.output_dir = str(out_dir)
 
+        job._stage_begin()
         transcript = fetch_bilibili_subtitle(job.url, out_dir, job, view_data, headers)
         if transcript:
+            job._stage_end("字幕获取")
             job.log("已获取字幕，跳过音频转写", 70)
         else:
+            job._stage_end("字幕获取(无)")
+            job._stage_begin()
             audio_path = download_audio(job.url, out_dir, job, view_data, headers)
             ffmpeg_path = shutil.which("ffmpeg")
             transcription_source = audio_path
@@ -761,23 +791,29 @@ def process_job(job: Job) -> None:
                 transcription_source = convert_for_transcription(audio_path, out_dir, job)
             else:
                 job.log("未找到 ffmpeg，直接使用下载的音频进行转写", 35)
+            job._stage_end("音频下载")
+            job._stage_begin()
             transcript = transcribe_with_faster_whisper(transcription_source, job)
+            job._stage_end("语音转写")
         transcript_path = out_dir / "transcript.txt"
         transcript_path.write_text(transcript, encoding="utf-8")
         job.transcript = transcript
         job.log("转写完成", 75)
 
+        job._stage_begin()
         if os.getenv("DEEPSEEK_API_KEY", "").strip():
             article = request_deepseek_article(transcript, job)
         else:
             job.log("未配置 DEEPSEEK_API_KEY，生成基础整理稿", 80)
             article = fallback_article(transcript)
+        job._stage_end("AI 文章生成")
 
         article_path = out_dir / "article.md"
         article_path.write_text(article, encoding="utf-8")
         job.article = article
         job.status = "done"
         job.log("任务完成", 100)
+        job.log(job.build_summary())
     except Exception as exc:
         job.status = "error"
         job.error = str(exc)
@@ -940,6 +976,7 @@ def save_job_article(job_id: str, pdf_dir: str | None = None, date_subdir: bool 
         article = job.article
         output_dir = job.output_dir
 
+    t0 = time.time()
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
     stem = Path(output_dir).name
     md_path = DOCS_DIR / f"{stem}.md"
@@ -957,10 +994,14 @@ def save_job_article(job_id: str, pdf_dir: str | None = None, date_subdir: bool 
         shutil.copy2(pdf_path, extra_pdf)
         extra_info = f"；额外保存到 {extra_pdf}"
 
+    elapsed = time.time() - t0
     with jobs_lock:
         job = jobs.get(job_id)
         if job:
-            job.log(f"文章已保存到 docs：{md_path}；{pdf_path}{extra_info}", 100)
+            summary = f"═══ 文件保存 ═══\n  Markdown：{md_path}\n  PDF：{pdf_path}\n  保存耗时：{elapsed:.1f}s"
+            if extra_info:
+                summary += extra_info
+            job.log(summary, 100)
 
     return {"path": str(md_path), "pdf_path": str(pdf_path)}
 
@@ -976,6 +1017,7 @@ def write_article_pdf(article: str, path: Path) -> None:
             SimpleDocTemplate,
             Table,
             TableStyle,
+            XPreformatted,
         )
         from reportlab.lib import colors
     except ImportError as exc:
@@ -1005,7 +1047,7 @@ def write_article_pdf(article: str, path: Path) -> None:
     code_style = ParagraphStyle(
         "CodeBlock",
         parent=normal,
-        fontName="Courier",
+        fontName=font_name,
         fontSize=9,
         leading=14,
         leftIndent=12,
@@ -1066,7 +1108,7 @@ def write_article_pdf(article: str, path: Path) -> None:
             elif tag in ("em", "i"):
                 self._buf += "<i>"
             elif tag == "code" and self._tag != "pre":
-                self._buf += '<font face="Courier">'
+                self._buf += f'<font face="{font_name}">'
             elif tag == "pre":
                 self._flush()
                 self._tag = "pre"
@@ -1169,8 +1211,7 @@ def write_article_pdf(article: str, path: Path) -> None:
             elif self._tag == "li":
                 self._list_items.append(text)
             elif self._tag == "pre":
-                text = text.replace("\n", "<br/>")
-                self.flowables.append(Paragraph(text, code_style))
+                self.flowables.append(XPreformatted(text, code_style))
             elif self._tag == "blockquote":
                 self.flowables.append(Paragraph(text, quote_style))
             else:
