@@ -144,8 +144,8 @@ queue_condition = threading.Condition()
 
 
 def sanitize_filename(value: str) -> str:
-    value = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-")
-    return value[:80] or "video"
+    value = re.sub(r"[^\w.\u4e00-\u9fff-]+", "-", value).strip("-")
+    return value[:100] or "video"
 
 
 def require_tool(name: str) -> str:
