@@ -759,6 +759,8 @@ def process_job(job: Job) -> None:
         if cached:
             transcript = (cached / "transcript.txt").read_text(encoding="utf-8")
             article = (cached / "article.md").read_text(encoding="utf-8")
+            if not article.startswith("> 原视频链接："):
+                article = f"> 原视频链接：{job.url}\n\n{article}"
             job.output_dir = str(cached)
             job.transcript = transcript
             job.article = article
@@ -809,8 +811,9 @@ def process_job(job: Job) -> None:
         job._stage_end("AI 文章生成")
 
         article_path = out_dir / "article.md"
-        article_path.write_text(article, encoding="utf-8")
-        job.article = article
+        article_with_source = f"> 原视频链接：{job.url}\n\n{article}"
+        article_path.write_text(article_with_source, encoding="utf-8")
+        job.article = article_with_source
         job.status = "done"
         job.log("任务完成", 100)
         job.log(job.build_summary())
