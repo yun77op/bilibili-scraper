@@ -970,11 +970,18 @@ def write_article_pdf(article: str, path: Path) -> None:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import mm
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+        from reportlab.platypus import (
+            HRFlowable,
+            Paragraph,
+            SimpleDocTemplate,
+        )
     except ImportError as exc:
         raise RuntimeError("缺少 PDF 依赖 reportlab。请执行：pip install reportlab") from exc
+
+    try:
+        import markdown
+    except ImportError:
+        raise RuntimeError("缺少 PDF 依赖 markdown。请执行：pip install markdown")
 
     font_name = register_pdf_font()
     styles = getSampleStyleSheet()
@@ -984,16 +991,131 @@ def write_article_pdf(article: str, path: Path) -> None:
         fontName=font_name,
         fontSize=10.5,
         leading=17,
-        spaceAfter=8,
+        spaceAfter=6,
     )
-    heading = ParagraphStyle(
-        "ArticleHeading",
+    heading_levels = {
+        "h1": ParagraphStyle("H1", parent=normal, fontSize=18, leading=24, spaceBefore=14, spaceAfter=8),
+        "h2": ParagraphStyle("H2", parent=normal, fontSize=15, leading=21, spaceBefore=12, spaceAfter=6),
+        "h3": ParagraphStyle("H3", parent=normal, fontSize=13, leading=19, spaceBefore=10, spaceAfter=6),
+        "h4": ParagraphStyle("H4", parent=normal, fontSize=12, leading=18, spaceBefore=8, spaceAfter=4),
+    }
+    code_style = ParagraphStyle(
+        "CodeBlock",
         parent=normal,
-        fontSize=16,
-        leading=22,
-        spaceBefore=10,
-        spaceAfter=10,
+        fontName="Courier",
+        fontSize=9,
+        leading=14,
+        leftIndent=12,
+        backColor="#f0f0f0",
+        spaceBefore=6,
+        spaceAfter=6,
     )
+    quote_style = ParagraphStyle(
+        "BlockQuote",
+        parent=normal,
+        leftIndent=20,
+        textColor="#555555",
+        spaceBefore=6,
+        spaceAfter=6,
+    )
+
+    html = markdown.markdown(article, output_format="xhtml")
+
+    from html.parser import HTMLParser
+
+    class Builder(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.flowables = []
+            self._buf = ""
+            self._tag = None
+            self._list_items = []
+            self._list_ordered = False
+
+        def handle_starttag(self, tag, attrs):
+            tag = tag.lower()
+            if tag in heading_levels:
+                self._flush()
+                self._tag = tag
+            elif tag == "p":
+                self._flush()
+                self._tag = "p"
+            elif tag == "li":
+                self._flush()
+                self._tag = "li"
+            elif tag == "ul":
+                self._list_ordered = False
+                self._list_items = []
+            elif tag == "ol":
+                self._list_ordered = True
+                self._list_items = []
+            elif tag == "hr":
+                self._flush()
+                self.flowables.append(HRFlowable(width="90%", thickness=0.5, spaceBefore=10, spaceAfter=10))
+            elif tag == "br":
+                self._buf += "<br/>"
+            elif tag in ("strong", "b"):
+                self._buf += "<b>"
+            elif tag in ("em", "i"):
+                self._buf += "<i>"
+            elif tag == "code" and self._tag != "pre":
+                self._buf += '<font face="Courier">'
+            elif tag == "pre":
+                self._flush()
+                self._tag = "pre"
+            elif tag == "blockquote":
+                self._flush()
+                self._tag = "blockquote"
+
+        def handle_endtag(self, tag):
+            tag = tag.lower()
+            if tag in heading_levels or tag in ("p", "li", "pre", "blockquote"):
+                self._flush()
+                self._tag = None
+            elif tag in ("ul", "ol"):
+                for i, item_text in enumerate(self._list_items, 1):
+                    if self._list_ordered:
+                        prefix = f"{i}. "
+                    else:
+                        prefix = "\u2022 "
+                    self.flowables.append(
+                        Paragraph(prefix + item_text, normal)
+                    )
+                self._list_items = []
+            elif tag in ("strong", "b"):
+                self._buf += "</b>"
+            elif tag in ("em", "i"):
+                self._buf += "</i>"
+            elif tag == "code" and self._tag != "pre":
+                self._buf += "</font>"
+
+        def handle_data(self, data):
+            self._buf += data
+
+        def _flush(self):
+            text = self._buf.strip()
+            self._buf = ""
+            if not text:
+                return
+            if self._tag in heading_levels:
+                self.flowables.append(Paragraph(text, heading_levels[self._tag]))
+            elif self._tag == "li":
+                self._list_items.append(text)
+            elif self._tag == "pre":
+                text = text.replace("\n", "<br/>")
+                self.flowables.append(Paragraph(text, code_style))
+            elif self._tag == "blockquote":
+                self.flowables.append(Paragraph(text, quote_style))
+            else:
+                self.flowables.append(Paragraph(text, normal))
+
+        def finish(self):
+            self._flush()
+            return self.flowables
+
+    builder = Builder()
+    builder.feed(html)
+    story = builder.finish()
 
     doc = SimpleDocTemplate(
         str(path),
@@ -1003,17 +1125,6 @@ def write_article_pdf(article: str, path: Path) -> None:
         topMargin=18 * mm,
         bottomMargin=18 * mm,
     )
-    story = []
-    for raw_line in article.splitlines():
-        line = raw_line.strip()
-        if not line:
-            story.append(Spacer(1, 5))
-            continue
-        if line.startswith("#"):
-            text = line.lstrip("#").strip()
-            story.append(Paragraph(escape_pdf_text(text), heading))
-        else:
-            story.append(Paragraph(escape_pdf_text(line), normal))
     doc.build(story)
 
 
@@ -1033,15 +1144,6 @@ def register_pdf_font() -> str:
                 pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
             return font_name
     return "Helvetica"
-
-
-def escape_pdf_text(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("  ", "&nbsp;&nbsp;")
-    )
 
 
 def main() -> None:
