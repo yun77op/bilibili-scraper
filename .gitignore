@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+outputs/
+models/
+docs/
+.env.local
+config.json

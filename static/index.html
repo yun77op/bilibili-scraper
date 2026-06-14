@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bilibili 视频转文章</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Bilibili 视频转文章</h1>
+            <p>优先读取字幕；没有字幕时自动下载音频并转写，再整理成文章。</p>
+          </div>
+          <div class="status-pill" id="statusPill">就绪</div>
+        </header>
+
+        <form id="jobForm" class="job-form">
+          <div class="input-row">
+            <textarea
+              id="urlInput"
+              placeholder="https://www.bilibili.com/video/BV...&#10;多个链接请换行输入"
+              autocomplete="off"
+              rows="2"
+            ></textarea>
+            <button id="submitBtn" type="submit">开始处理</button>
+          </div>
+        </form>
+
+        <section class="config-section">
+          <div class="config-head">
+            <h3>保存设置</h3>
+            <button id="saveConfigBtn" class="ghost" type="button">保存配置</button>
+          </div>
+          <div class="config-body">
+            <input
+              id="pdfDirInput"
+              type="text"
+              placeholder="可选：PDF 额外保存目录，如 D:\articles"
+              autocomplete="off"
+            />
+            <label class="auto-save-label">
+              <input type="checkbox" id="autoSaveCheck" />
+              处理完成后自动保存到 docs 和上述目录
+            </label>
+            <label class="auto-save-label">
+              <input type="checkbox" id="dateSubdirCheck" />
+              PDF 按日期分目录（如 D:\articles\20260613\）
+            </label>
+          </div>
+        </section>
+
+        <div class="progress-wrap" aria-label="处理进度">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+
+        <section class="panels">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>运行日志</h2>
+              <span id="stageText">等待输入链接</span>
+              <span id="elapsedText" class="elapsed"></span>
+            </div>
+            <pre id="logBox" class="log-box"></pre>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>转写稿</h2>
+              <button class="ghost" data-copy-target="transcriptBox" type="button">复制</button>
+            </div>
+            <textarea id="transcriptBox" readonly placeholder="转写完成后会显示在这里"></textarea>
+          </article>
+
+          <article class="panel article-panel">
+            <div class="panel-head">
+              <h2>整理文章</h2>
+              <div class="panel-actions">
+                <button class="ghost" data-copy-target="articleBox" type="button">复制</button>
+                <button class="ghost" id="saveDocBtn" type="button" disabled>保存到 docs</button>
+              </div>
+            </div>
+            <textarea id="articleBox" readonly placeholder="文章生成后会显示在这里"></textarea>
+            <div class="save-status" id="saveStatus"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
