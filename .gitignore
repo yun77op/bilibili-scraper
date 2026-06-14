@@ -6,3 +6,4 @@ models/
 docs/
 .env.local
 config.json
+server.log
