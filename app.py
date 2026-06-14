@@ -1022,7 +1022,7 @@ def write_article_pdf(article: str, path: Path) -> None:
         spaceAfter=6,
     )
 
-    html = markdown.markdown(article, output_format="xhtml", extensions=["tables"])
+    html = markdown.markdown(article, output_format="xhtml", extensions=["tables", "fenced_code"])
 
     from html.parser import HTMLParser
 
