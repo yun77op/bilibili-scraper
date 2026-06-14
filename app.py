@@ -1244,6 +1244,7 @@ def register_pdf_font() -> str:
     from reportlab.pdfbase.ttfonts import TTFont
 
     font_candidates = [
+        Path("C:/Windows/Fonts/NotoSansSC-VF.ttf"),
         Path("C:/Windows/Fonts/simsun.ttc"),
         Path("C:/Windows/Fonts/simhei.ttf"),
         Path("C:/Windows/Fonts/Deng.ttf"),
