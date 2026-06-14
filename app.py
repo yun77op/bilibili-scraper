@@ -974,7 +974,10 @@ def write_article_pdf(article: str, path: Path) -> None:
             HRFlowable,
             Paragraph,
             SimpleDocTemplate,
+            Table,
+            TableStyle,
         )
+        from reportlab.lib import colors
     except ImportError as exc:
         raise RuntimeError("缺少 PDF 依赖 reportlab。请执行：pip install reportlab") from exc
 
@@ -1019,7 +1022,7 @@ def write_article_pdf(article: str, path: Path) -> None:
         spaceAfter=6,
     )
 
-    html = markdown.markdown(article, output_format="xhtml")
+    html = markdown.markdown(article, output_format="xhtml", extensions=["tables"])
 
     from html.parser import HTMLParser
 
@@ -1031,6 +1034,10 @@ def write_article_pdf(article: str, path: Path) -> None:
             self._tag = None
             self._list_items = []
             self._list_ordered = False
+            self._table_rows = []
+            self._table_header = []
+            self._in_table = False
+            self._in_thead = False
 
         def handle_starttag(self, tag, attrs):
             tag = tag.lower()
@@ -1066,6 +1073,18 @@ def write_article_pdf(article: str, path: Path) -> None:
             elif tag == "blockquote":
                 self._flush()
                 self._tag = "blockquote"
+            elif tag == "table":
+                self._in_table = True
+                self._table_rows = []
+                self._table_header = []
+            elif tag == "thead":
+                self._in_thead = True
+            elif tag == "tbody":
+                self._in_thead = False
+            elif tag == "tr":
+                self._table_current_row = []
+            elif tag in ("th", "td"):
+                self._buf = ""
 
         def handle_endtag(self, tag):
             tag = tag.lower()
@@ -1088,6 +1107,54 @@ def write_article_pdf(article: str, path: Path) -> None:
                 self._buf += "</i>"
             elif tag == "code" and self._tag != "pre":
                 self._buf += "</font>"
+            elif tag == "table":
+                self._in_table = False
+                self._build_table()
+            elif tag == "tr":
+                if hasattr(self, "_table_current_row"):
+                    if self._in_thead:
+                        self._table_header = self._table_current_row
+                    else:
+                        self._table_rows.append(self._table_current_row)
+                    del self._table_current_row
+            elif tag in ("th", "td"):
+                if hasattr(self, "_table_current_row"):
+                    self._table_current_row.append(self._buf.strip())
+                    self._buf = ""
+
+        def _build_table(self):
+            if not self._table_rows and not self._table_header:
+                return
+            header_style = ParagraphStyle(
+                "TableHeader",
+                parent=normal,
+                fontSize=9,
+                leading=13,
+                alignment=1,
+            )
+            cell_style = ParagraphStyle(
+                "TableCell",
+                parent=normal,
+                fontSize=9,
+                leading=13,
+            )
+            all_rows = []
+            if self._table_header:
+                all_rows.append([Paragraph(h, header_style) for h in self._table_header])
+            for row in self._table_rows:
+                all_rows.append([Paragraph(c, cell_style) for c in row])
+            if all_rows:
+                col_count = len(all_rows[0])
+                available_width = 155 * mm
+                col_widths = [available_width / col_count] * col_count
+                tbl = Table(all_rows, colWidths=col_widths)
+                tbl.setStyle(TableStyle([
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e0e0e0")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]))
+                self.flowables.append(tbl)
 
         def handle_data(self, data):
             self._buf += data
