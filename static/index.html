@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Bilibili 视频转文章</title>
+    <title>视频转文章 - Bilibili & YouTube</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -11,80 +11,135 @@
       <section class="workspace">
         <header class="topbar">
           <div>
-            <h1>Bilibili 视频转文章</h1>
-            <p>优先读取字幕；没有字幕时自动下载音频并转写，再整理成文章。</p>
+            <h1>视频转文章</h1>
+            <p>支持 Bilibili、YouTube。优先读取字幕；没有字幕时自动下载音频并转写，再整理成文章。</p>
           </div>
-          <div class="status-pill" id="statusPill">就绪</div>
+          <div class="topbar-right">
+            <div class="worker-status" id="workerStatus" title="后台 Worker 状态">
+              <span class="worker-dot"></span>
+              <span class="worker-text">检测中…</span>
+            </div>
+            <div class="status-pill" id="statusPill">就绪</div>
+          </div>
         </header>
 
         <form id="jobForm" class="job-form">
-          <div class="input-row">
-            <textarea
-              id="urlInput"
-              placeholder="https://www.bilibili.com/video/BV...&#10;多个链接请换行输入"
-              autocomplete="off"
-              rows="2"
-            ></textarea>
-            <button id="submitBtn" type="submit">开始处理</button>
+          <div id="urlInputs" class="url-rows">
+            <div class="url-row">
+              <input
+                class="url-input"
+                type="text"
+                placeholder="粘贴 B站 / YouTube 链接，按回车开始"
+                autocomplete="off"
+              />
+              <button class="url-row-btn add-row" type="button" title="添加一行">+</button>
+              <button class="url-row-btn remove-row" type="button" title="移除此行">−</button>
+            </div>
           </div>
+          <button id="submitBtn" type="submit">全部开始</button>
         </form>
 
         <section class="config-section">
           <div class="config-head">
-            <h3>保存设置</h3>
+            <h3>输出设置</h3>
             <button id="saveConfigBtn" class="ghost" type="button">保存配置</button>
           </div>
           <div class="config-body">
-            <input
-              id="pdfDirInput"
-              type="text"
-              placeholder="可选：PDF 额外保存目录，如 D:\articles"
-              autocomplete="off"
-            />
-            <label class="auto-save-label">
-              <input type="checkbox" id="autoSaveCheck" />
-              处理完成后自动保存到 docs 和上述目录
-            </label>
-            <label class="auto-save-label">
-              <input type="checkbox" id="dateSubdirCheck" />
-              PDF 按日期分目录（如 D:\articles\20260613\）
-            </label>
+            <!-- 输出渠道 -->
+            <div class="channel-group">
+              <div class="channel-label">📤 输出渠道</div>
+
+              <div class="channel-sub">
+                <span class="channel-sub-label">📁 本地文件</span>
+                <input
+                  id="pdfDirInput"
+                  type="text"
+                  placeholder="额外保存目录，如 ~/articles（可选）"
+                  autocomplete="off"
+                />
+                <div class="gdrive-format-row">
+                  <label>保存格式：</label>
+                  <select id="saveFormatSelect">
+                    <option value="pdf">PDF（打印/归档）</option>
+                    <option value="html">HTML（浏览器阅读）</option>
+                    <option value="both">PDF + HTML</option>
+                  </select>
+                </div>
+                <label class="auto-save-label">
+                  <input type="checkbox" id="autoSaveCheck" />
+                  处理完成后自动保存
+                </label>
+              </div>
+
+              <div class="channel-sub">
+                <span class="channel-sub-label">☁️ Google Drive</span>
+                <label class="auto-save-label">
+                  <input type="checkbox" id="gdriveCheck" />
+                  上传到 Google Drive
+                </label>
+                <div class="gdrive-detail" id="gdriveDetail">
+                  <input
+                    id="gdriveFolderInput"
+                    type="text"
+                    placeholder="文件夹名称或 ID（如 bilibili文章，留空上传到根目录）"
+                    autocomplete="off"
+                  />
+                  <div class="gdrive-format-row">
+                    <label>上传格式：</label>
+                    <select id="gdriveFormatSelect">
+                      <option value="html">HTML（手机阅读）</option>
+                      <option value="pdf">PDF（打印/归档）</option>
+                    </select>
+                  </div>
+                  <div class="gdrive-auth-row">
+                    <span id="gdriveStatus" class="cookie-status">未授权</span>
+                    <button id="gdriveAuthBtn" type="button" class="ghost">授权 Google Drive</button>
+                  </div>
+                </div>
+              </div>
+
+              <label class="auto-save-label">
+                <input type="checkbox" id="dateSubdirCheck" />
+                按日期分目录（本地与 Drive 均生效）
+              </label>
+            </div>
+
+            <!-- 鉴权 -->
+            <div class="channel-group">
+              <div class="channel-label">🔐 YouTube 鉴权</div>
+              <div class="cookie-config">
+                <textarea
+                  id="youtubeCookieInput"
+                  placeholder="粘贴 YouTube Cookie（Cookie-Editor 导出）"
+                  rows="3"
+                  autocomplete="off"
+                ></textarea>
+                <div class="cookie-row">
+                  <span id="youtubeCookieStatus" class="cookie-status">未配置</span>
+                  <button id="youtubeLoginBtn" type="button" class="ghost">浏览器登录</button>
+                </div>
+                <span id="youtubeLoginStatus" class="cookie-status"></span>
+              </div>
+            </div>
           </div>
         </section>
 
-        <div class="progress-wrap" aria-label="处理进度">
-          <div class="progress-bar" id="progressBar"></div>
+        <div class="status-row" aria-label="处理状态">
+          <div class="progress-wrap">
+            <div class="progress-bar" id="progressBar"></div>
+          </div>
+          <div class="status-info">
+            <span id="stageText">等待输入链接</span>
+            <span id="elapsedText" class="elapsed"></span>
+          </div>
         </div>
 
-        <section class="panels">
-          <article class="panel">
-            <div class="panel-head">
-              <h2>运行日志</h2>
-              <span id="stageText">等待输入链接</span>
-              <span id="elapsedText" class="elapsed"></span>
-            </div>
-            <pre id="logBox" class="log-box"></pre>
-          </article>
-
-          <article class="panel">
-            <div class="panel-head">
-              <h2>转写稿</h2>
-              <button class="ghost" data-copy-target="transcriptBox" type="button">复制</button>
-            </div>
-            <textarea id="transcriptBox" readonly placeholder="转写完成后会显示在这里"></textarea>
-          </article>
-
-          <article class="panel article-panel">
-            <div class="panel-head">
-              <h2>整理文章</h2>
-              <div class="panel-actions">
-                <button class="ghost" data-copy-target="articleBox" type="button">复制</button>
-                <button class="ghost" id="saveDocBtn" type="button" disabled>保存到 docs</button>
-              </div>
-            </div>
-            <textarea id="articleBox" readonly placeholder="文章生成后会显示在这里"></textarea>
-            <div class="save-status" id="saveStatus"></div>
-          </article>
+        <section class="job-history" id="jobHistory">
+          <div class="job-history-head">
+            <h2>📋 任务历史</h2>
+            <span class="job-count" id="jobCount"></span>
+          </div>
+          <div class="job-list" id="jobList"></div>
         </section>
       </section>
     </main>

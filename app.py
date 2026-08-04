@@ -17,12 +17,22 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
+
+import requests
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+
+from gdrive_uploader import (
+    check_dependencies as gdrive_check_deps,
+    exchange_code as gdrive_exchange_code,
+    get_auth_url as gdrive_get_auth_url,
+    is_authenticated as gdrive_is_authenticated,
+    upload_file as gdrive_upload_file,
+)
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -60,7 +70,7 @@ def load_local_env(path: Path = ENV_FILE) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         if key:
-            os.environ.setdefault(key, value)
+            os.environ[key] = value
 
 
 load_local_env()
@@ -93,6 +103,7 @@ def save_config(config: dict[str, Any]) -> None:
 class Job:
     id: str
     url: str
+    title: str = ""
     cookie_string: str = ""
     status: str = "queued"
     stage: str = "等待开始"
@@ -102,6 +113,8 @@ class Job:
     article: str = ""
     error: str = ""
     output_dir: str = ""
+    page_output_dirs: list[str] = field(default_factory=list)
+    page_articles: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -137,10 +150,27 @@ class Job:
         return "\n".join(lines)
 
 
-jobs: dict[str, Job] = {}
-jobs_lock = threading.Lock()
-job_queue: list[Job] = []
-queue_condition = threading.Condition()
+# ── 数据库（SQLite）替代了原来的内存 dict/list ──────────────────
+# 所有任务状态通过 db.py 读写，server 和 worker 共享同一个 jobs.db
+import db as _db  # noqa: E402
+
+
+# ── 取消机制 ────────────────────────────────────────────────────
+
+class JobCancelledError(Exception):
+    """任务已被用户取消"""
+    pass
+
+
+def check_cancelled(job: Job) -> None:
+    """如果任务被取消则抛出 JobCancelledError"""
+    if _db.is_job_cancelled(job.id):
+        raise JobCancelledError(f"任务 {job.id} 已被取消")
+
+
+# DeepSeek 取消机制：全局注册表，用于中断进行中的 HTTP 请求
+_cancel_sessions: dict[str, tuple[threading.Event, requests.Session]] = {}
+_cancel_lock = threading.Lock()
 
 
 def sanitize_filename(value: str) -> str:
@@ -215,6 +245,16 @@ def run_command(args: list[str], cwd: Path, job: Job, redactions: list[str] | No
             job.updated_at = time.time()
     code = process.wait()
     if code:
+        if code < 0:
+            import signal as _signal
+            sig_name = f"信号 {abs(code)}"
+            try:
+                sig_name = _signal.Signals(abs(code)).name
+            except ValueError:
+                pass
+            raise RuntimeError(
+                f"命令被终止（{sig_name}）：{' '.join(args)}"
+            )
         raise RuntimeError(f"命令执行失败，退出码 {code}：{' '.join(args)}")
 
 
@@ -338,6 +378,139 @@ def pick_subtitle(subtitles: list[dict[str, Any]]) -> dict[str, Any]:
     return subtitles[0]
 
 
+def fetch_youtube_info(url: str, job: Job) -> dict:
+    job.log("正在获取 YouTube 视频信息", 10)
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("缺少 Python 依赖 yt-dlp。请执行：pip install yt-dlp")
+
+    ydl_opts: dict[str, Any] = {"quiet": True, "no_warnings": True, "socket_timeout": 60}
+    proxy = os.getenv("BILIBILI_PROXY", "").strip()
+    if proxy:
+        ydl_opts["proxy"] = proxy
+    youtube_browser = os.getenv("YOUTUBE_BROWSER", "").strip()
+    if youtube_browser:
+        job.log(f"正在从浏览器读取 YouTube Cookie：{youtube_browser}", 11)
+        ydl_opts["cookiesfrombrowser"] = (youtube_browser,)
+    else:
+        cookie_result = _resolve_youtube_cookies(job)
+        if cookie_result:
+            ydl_opts["cookiefile"] = cookie_result
+            job.log(f"已加载 YouTube Cookie", 11)
+        else:
+            job.log("未检测到 YouTube Cookie", 11)
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False, process=False)
+
+
+def download_youtube_audio(url: str, out_dir: Path, job: Job, info: dict) -> Path:
+    job.log("正在下载 YouTube 音频", 25)
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("缺少 Python 依赖 yt-dlp。")
+
+    yt_id = extract_youtube_id(url)
+    title = info.get("title") or yt_id
+    safe_title = sanitize_filename(title)
+    output_template = str(out_dir / f"{safe_title}-{yt_id}.%(ext)s")
+
+    def _progress_hook(d: dict) -> None:
+        if d["status"] == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            if total:
+                job.progress = min(48, 35 + int(downloaded / total * 13))
+                job.updated_at = time.time()
+        elif d["status"] == "finished":
+            job.progress = 48
+
+    ydl_opts: dict[str, Any] = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 60,
+        "progress_hooks": [_progress_hook],
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}],
+        "remote_components": ["ejs:github"],
+    }
+
+    proxy = os.getenv("BILIBILI_PROXY", "").strip()
+    if proxy:
+        ydl_opts["proxy"] = proxy
+    youtube_browser = os.getenv("YOUTUBE_BROWSER", "").strip()
+    if youtube_browser:
+        ydl_opts["cookiesfrombrowser"] = (youtube_browser,)
+    else:
+        cookie_result = _resolve_youtube_cookies(job)
+        if cookie_result:
+            ydl_opts["cookiefile"] = cookie_result
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    audio_path = out_dir / f"{safe_title}-{yt_id}.m4a"
+    if not audio_path.exists():
+        candidates = sorted(out_dir.glob(f"{safe_title}*.m4a"))
+        if not candidates:
+            candidates = sorted(out_dir.glob("*.m4a"))
+        if candidates:
+            audio_path = candidates[0]
+        else:
+            raise RuntimeError("YouTube 音频下载后未找到文件。")
+    return audio_path
+
+
+def fetch_youtube_subtitle(url: str, out_dir: Path, job: Job, info: dict) -> str | None:
+    job.log("正在检查 YouTube 字幕", 12)
+
+    subtitles = info.get("subtitles") or {}
+    auto_captions = info.get("automatic_captions") or {}
+    preferred_langs = ["zh-Hans", "zh-Hant", "zh", "zh-CN", "en"]
+
+    for lang in preferred_langs:
+        for subtitle_dict in [subtitles, auto_captions]:
+            if lang in subtitle_dict:
+                sub_list = subtitle_dict[lang]
+                if sub_list:
+                    sub_info = sub_list[0]
+                    sub_url = sub_info.get("url")
+                    if sub_url:
+                        job.log(f"正在下载 YouTube 字幕：{lang}", 25)
+                        try:
+                            raw = http_get(sub_url, {})
+                        except RuntimeError as exc:
+                            job.log(f"YouTube 字幕下载失败：{exc}，改为音频转写", 25)
+                            continue
+                        raw_path = out_dir / "subtitle.json"
+                        raw_path.write_bytes(raw)
+                        return parse_youtube_subtitle_json3(raw)
+
+    job.log("未找到 YouTube 可用字幕，准备下载音频转写", 14)
+    return None
+
+
+def parse_youtube_subtitle_json3(raw_data: bytes) -> str | None:
+    data = json.loads(raw_data.decode("utf-8"))
+    events = data.get("events") or []
+    lines = []
+    for event in events:
+        t_start_ms = event.get("tStartMs", 0)
+        d_duration_ms = event.get("dDurationMs", 0)
+        segs = event.get("segs") or []
+        text_parts = [str(seg.get("utf8", "")).strip() for seg in segs if seg.get("utf8")]
+        content = "".join(text_parts).strip()
+        if not content:
+            continue
+        start = t_start_ms / 1000.0
+        end = (t_start_ms + d_duration_ms) / 1000.0
+        lines.append(f"[{format_timestamp(start)} - {format_timestamp(end)}] {content}")
+    return "\n".join(lines) if lines else None
+
+
 def extract_bvid(url: str) -> str:
     match = re.search(r"(BV[0-9A-Za-z]+)", url)
     if not match:
@@ -369,6 +542,44 @@ def extract_page_index(url: str) -> int:
         return 0
 
 
+def identify_platform(url: str) -> str:
+    if re.search(r"(youtube\.com|youtu\.be)", url):
+        return "youtube"
+    if re.search(r"bilibili\.com", url):
+        return "bilibili"
+    raise RuntimeError("暂不支持的平台。目前支持 Bilibili 和 YouTube。")
+
+
+def extract_youtube_id(url: str) -> str:
+    match = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if match:
+        return match.group(1)
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    v = query.get("v")
+    if v:
+        return v[0]
+    match = re.search(r"youtube\.com/(?:embed|shorts|live)/([A-Za-z0-9_-]{11})", url)
+    if match:
+        return match.group(1)
+    raise RuntimeError("没有从 URL 中识别到 YouTube 视频 ID。")
+
+
+def find_cached_output_yt(yt_id: str) -> Path | None:
+    if not OUTPUT_DIR.exists():
+        return None
+    for d in sorted(OUTPUT_DIR.iterdir(), reverse=True):
+        if not d.is_dir():
+            continue
+        if f"youtube-{yt_id}" not in d.name:
+            continue
+        transcript = d / "transcript.txt"
+        article = d / "article.md"
+        if transcript.exists() and article.exists():
+            return d
+    return None
+
+
 def build_bilibili_headers(referer: str, cookie_string: str) -> dict[str, str]:
     headers = {
         "User-Agent": BILIBILI_USER_AGENT,
@@ -382,30 +593,73 @@ def build_bilibili_headers(referer: str, cookie_string: str) -> dict[str, str]:
     return headers
 
 
-def load_cookie_string(job: Job) -> str:
+def load_cookie_string(job: Job, platform: str = "bilibili") -> str:
     if job.cookie_string.strip():
         return job.cookie_string.strip()
-    env_cookie = os.getenv("BILIBILI_COOKIE", "").strip()
+
+    if platform == "youtube":
+        cookie_env = "YOUTUBE_COOKIE"
+        file_env = "YOUTUBE_COOKIES_FILE"
+        config_key = "youtube_cookie"
+        default_file = ROOT / "youtube-cookies.txt"
+    else:
+        cookie_env = "BILIBILI_COOKIE"
+        file_env = "BILIBILI_COOKIES_FILE"
+        config_key = "bilibili_cookie"
+        default_file = None
+
+    env_cookie = os.getenv(cookie_env, "").strip()
     if env_cookie:
         return env_cookie
-    cookie_file = os.getenv("BILIBILI_COOKIES_FILE", "").strip()
+    cookie_file = os.getenv(file_env, "").strip()
     if cookie_file:
-        return read_netscape_cookie_file(Path(cookie_file))
-    return ""
+        cookie_path = Path(cookie_file)
+        if not cookie_path.is_absolute():
+            cookie_path = ROOT / cookie_path
+        if cookie_path.exists():
+            return read_netscape_cookie_file(cookie_path)
+    if default_file and default_file.exists():
+        return read_netscape_cookie_file(default_file)
+    config = load_config()
+    config_cookie = str(config.get(config_key, "")).strip()
+    return config_cookie
+
+
+def _resolve_youtube_cookies(job: Job) -> str | None:
+    cookie_string = load_cookie_string(job, "youtube")
+    if not cookie_string:
+        return None
+    raw_path = ROOT / "youtube-cookies.txt"
+    if raw_path.exists() and "\t" in raw_path.read_text(encoding="utf-8", errors="replace"):
+        with open(raw_path, encoding="utf-8") as f:
+            content = f.read()
+        handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="youtube-cookies-", suffix=".txt", delete=False)
+        handle.write(content)
+        handle.close()
+        return handle.name
+    cookie_file = write_temp_cookie_file(cookie_string, "youtube")
+    return str(cookie_file)
 
 
 def read_netscape_cookie_file(path: Path) -> str:
     if not path.exists():
         raise RuntimeError(f"Cookie 文件不存在：{path}")
-    cookies: list[str] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) >= 7:
-            cookies.append(f"{parts[5]}={parts[6]}")
-    return "; ".join(cookies)
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if "\t" in raw:
+        cookies: list[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies.append(f"{parts[5]}={parts[6]}")
+        return "; ".join(cookies)
+    return raw.strip()
 
 
 def bilibili_json(
@@ -462,21 +716,69 @@ def audio_extension(audio_stream: dict[str, Any], audio_url: str) -> str:
 
 def download_file(url: str, path: Path, headers: dict[str, str], job: Job) -> None:
     proxy = os.getenv("BILIBILI_PROXY", "").strip()
+    max_retries = 3
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            _download_file_attempt(url, path, headers, job, proxy, attempt)
+            return
+        except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError) as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                wait = (attempt + 1) * 3
+                job.log(f"下载中断，{wait}秒后重试（{attempt + 1}/{max_retries}）...", job.progress)
+                time.sleep(wait)
+                check_cancelled(job)
+            else:
+                raise
+
+    if last_error:
+        raise last_error
+
+
+def _download_file_attempt(url: str, path: Path, headers: dict[str, str],
+                           job: Job, proxy: str, attempt: int) -> None:
     opener = urllib.request.build_opener()
     if proxy:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    request = urllib.request.Request(url, headers={**headers, "Accept": "*/*"}, method="GET")
+
+    req_headers = {**headers, "Accept": "*/*"}
+
+    # Resume from partial download
+    if attempt > 0 and path.exists():
+        existing_size = path.stat().st_size
+        if existing_size > 0:
+            req_headers["Range"] = f"bytes={existing_size}-"
+            job.log(f"断点续传，从 {existing_size / 1024 / 1024:.1f}MB 处继续", job.progress)
+
+    request = urllib.request.Request(url, headers=req_headers, method="GET")
     try:
-        with opener.open(request, timeout=60) as response:
+        with opener.open(request, timeout=120) as response:
             total = int(response.headers.get("Content-Length") or "0")
-            downloaded = 0
-            with path.open("wb") as output:
+            # If server honored Range request, total is remaining bytes
+            if "Content-Range" in response.headers:
+                # e.g. "bytes 88092236-145217531/145217532"
+                content_range = response.headers["Content-Range"]
+                try:
+                    parts = content_range.split("/")
+                    total = int(parts[-1]) if len(parts) > 1 else total
+                except (ValueError, IndexError):
+                    pass
+
+            downloaded = path.stat().st_size if (attempt > 0 and path.exists()) else 0
+            mode = "ab" if downloaded > 0 else "wb"
+            chunk_count = 0
+            with path.open(mode) as output:
                 while True:
                     chunk = response.read(1024 * 256)
                     if not chunk:
                         break
                     output.write(chunk)
                     downloaded += len(chunk)
+                    chunk_count += 1
+                    if chunk_count % 5 == 0:
+                        check_cancelled(job)
                     if total:
                         job.progress = min(48, 35 + int(downloaded / total * 13))
                         job.updated_at = time.time()
@@ -490,11 +792,11 @@ def download_file(url: str, path: Path, headers: dict[str, str], job: Job) -> No
         raise RuntimeError("音频下载结果为空。")
 
 
-def write_temp_cookie_file(cookie_string: str) -> Path:
+def write_temp_cookie_file(cookie_string: str, platform: str = "bilibili") -> Path:
     handle = tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
-        prefix="bilibili-cookies-",
+        prefix=f"{platform}-cookies-",
         suffix=".txt",
         delete=False,
     )
@@ -502,8 +804,12 @@ def write_temp_cookie_file(cookie_string: str) -> Path:
     with handle:
         handle.write("# Netscape HTTP Cookie File\n")
         for name, value in parse_cookie_header(cookie_string).items():
-            handle.write(f".bilibili.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n")
-            handle.write(f"bilibili.com\tFALSE\t/\tFALSE\t0\t{name}\t{value}\n")
+            if platform == "youtube":
+                handle.write(f".youtube.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n")
+                handle.write(f"youtube.com\tFALSE\t/\tFALSE\t0\t{name}\t{value}\n")
+            else:
+                handle.write(f".bilibili.com\tTRUE\t/\tFALSE\t0\t{name}\t{value}\n")
+                handle.write(f"bilibili.com\tFALSE\t/\tFALSE\t0\t{name}\t{value}\n")
     return path
 
 
@@ -531,6 +837,7 @@ def validate_cookie_string(cookie_string: str) -> None:
 
 
 def convert_for_transcription(audio_path: Path, out_dir: Path, job: Job) -> Path:
+    check_cancelled(job)
     ffmpeg = require_tool("ffmpeg")
     wav_path = out_dir / "audio-16k-mono.wav"
     job.log("正在转换音频格式", 35)
@@ -559,7 +866,7 @@ def wav_duration_seconds(path: Path) -> float:
         return frames / float(rate)
 
 
-def transcribe_with_faster_whisper(audio_path: Path, job: Job) -> str:
+def transcribe_with_faster_whisper(audio_path: Path, job: Job, page_label: str = "") -> str:
     configure_cuda_dll_paths()
     HF_HOME.mkdir(parents=True, exist_ok=True)
     WHISPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -576,9 +883,9 @@ def transcribe_with_faster_whisper(audio_path: Path, job: Job) -> str:
         ) from exc
 
     model_name = os.getenv("WHISPER_MODEL", "base")
-    device = os.getenv("WHISPER_DEVICE", "cuda")
-    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "float16" if device == "cuda" else "int8")
-    job.log(f"正在转写音频，本地模型：{model_name}", 50)
+    device = os.getenv("WHISPER_DEVICE", "auto")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
+    job.log(f"{page_label}正在转写音频，本地模型：{model_name}", 50)
     model_path = ensure_whisper_model(model_name, job)
     model = WhisperModel(
         model_path,
@@ -597,10 +904,14 @@ def transcribe_with_faster_whisper(audio_path: Path, job: Job) -> str:
     )
 
     lines: list[str] = []
+    seg_count = 0
     for segment in segments:
         start = format_timestamp(segment.start)
         end = format_timestamp(segment.end)
         lines.append(f"[{start} - {end}] {segment.text.strip()}")
+        seg_count += 1
+        if seg_count % 10 == 0:
+            check_cancelled(job)
         if audio_path.suffix.lower() == ".wav":
             job.progress = min(70, 50 + int(segment.end / duration * 20))
         else:
@@ -649,6 +960,82 @@ def format_timestamp(seconds: float) -> str:
     return f"{hh:02d}:{mm:02d}:{ss:02d}"
 
 
+# --- Markdown 修复 -----------------------------------------------------------------
+
+_TABLE_DELIM_RE = re.compile(r"\|\s*:?-{2,}:?\s*\|")
+_TABLE_BOUNDARY_RE = re.compile(r"\|\s*\|")
+_LIST_ITEM_RE = re.compile(r"\s*([*+-]|\d{1,2}[.、])\s")
+_INLINE_BULLET_RE = re.compile(r"(?<=[。！？；：])\s+([*+-])\s+")
+_INLINE_NUMBERED_RE = re.compile(r"(?<=[。！？；：])\s+(\d{1,2})\.\s+")
+
+
+def _repair_squashed_table(line: str) -> list[str]:
+    """把被模型挤到同一行的表格拆成标准的 Markdown 表格行。"""
+    first_pipe = line.find("|")
+    prefix = line[:first_pipe].strip()
+    rows: list[str] = []
+    for part in _TABLE_BOUNDARY_RE.split(line[first_pipe:]):
+        row = part.strip()
+        if not row:
+            continue
+        if not row.startswith("|"):
+            row = "| " + row
+        if not row.endswith("|"):
+            row = row + " |"
+        rows.append(row)
+    # 至少要有表头 + 分隔行才认为是表格，否则保持原样
+    if len(rows) < 2 or not _TABLE_DELIM_RE.search(rows[1]):
+        return [line]
+    out: list[str] = []
+    if prefix:
+        out.extend([prefix, ""])
+    out.extend(rows)
+    out.append("")
+    return out
+
+
+def _split_inline_list_items(line: str) -> list[str]:
+    """把"……。 * 要点一。 * 要点二"这类挤在一行的列表拆成逐项一行。"""
+    if "。" not in line and "：" not in line and "；" not in line:
+        return [line]
+    new = _INLINE_BULLET_RE.sub(lambda m: "\n" + m.group(1) + " ", line)
+    new = _INLINE_NUMBERED_RE.sub(lambda m: "\n" + m.group(1) + ". ", new)
+    return [part for part in new.split("\n") if part.strip()]
+
+
+def repair_article_markdown(article: str) -> str:
+    """尽力修复 LLM 常见的 Markdown 格式错误（表格、列表挤在一行），
+    保证后续的 HTML / PDF 渲染器能正常解析。"""
+    out: list[str] = []
+    in_code = False
+    for line in article.split("\n"):
+        if line.strip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        if _TABLE_DELIM_RE.search(line) and line.count("|") >= 6:
+            pieces = _repair_squashed_table(line)
+        else:
+            pieces = _split_inline_list_items(line)
+        for piece in pieces:
+            # 列表项紧跟在普通段落后面时，前面补空行，否则解析器不认；
+            # 普通段落紧跟在列表项/表格行后面时同样补空行，避免被吞进上一块
+            if out and out[-1].strip() and piece.strip():
+                prev_is_block = bool(
+                    _LIST_ITEM_RE.match(out[-1]) or out[-1].lstrip().startswith("|")
+                )
+                cur_is_block = bool(
+                    _LIST_ITEM_RE.match(piece) or piece.lstrip().startswith("|")
+                )
+                if prev_is_block != cur_is_block:
+                    out.append("")
+            out.append(piece)
+    return "\n".join(out)
+
+
 def build_article_prompt(transcript: str) -> str:
     return (
         "请把下面的视频转写稿整理成一篇内容详实、结构清晰、图文并茂的简体中文技术文章。无论原视频或转写稿是什么语言，最终都必须输出简体中文（不得使用繁体中文）。\n\n"
@@ -657,25 +1044,31 @@ def build_article_prompt(transcript: str) -> str:
         "格式与结构要求：\n"
         "1. 文章开头生成清晰的标题和副标题，然后列出目录（Markdown 锚点链接）。\n"
         "2. 正文使用多级标题（##、###、####）组织，每个主题独立成节，节与节之间用 `---` 分隔。\n"
-        "3. 关键概念、对比信息、参数说明、优缺点等，**必须使用 Markdown 表格**呈现，不要用纯文字罗列。\n"
-        "4. 如果原文涉及流程、架构、时序、决策分支等内容，用 ```text 代码块绘制 ASCII 图表来可视化。\n"
+        "3. 关键概念、对比信息、参数说明、优缺点等，**必须使用 Markdown 表格**呈现，不要用纯文字罗列。表格必须严格遵守 Markdown 语法：表头、分隔行（`| --- | --- |`）和每一行数据都各自独占一行，表格上方留一个空行，禁止把整个表格连写在同一行；列表（`-`、`1.`）的每一项也必须各自独占一行，禁止把多个列表项连写在同一段落里。\n"
+        "4. 如果原文涉及流程、架构、时序、决策分支等内容，用 ```mermaid 代码块绘制 Mermaid 图表（flowchart、sequenceDiagram 等）来可视化，不要用 ASCII 字符画图。Mermaid 语法务必严格正确：节点 id 只用英文字母和数字，节点的中文标签统一放在引号内（如 A[\"开始处理\"]），箭头上的标签用 |...| 包裹。\n"
         "5. 对原文的核心观点，逐条展开：解释背景、拆解原理、说明应用场景、指出局限性、给出实践建议。不要只做摘要。\n"
         '6. 每个重要结论后用 > 引用块提炼一句"核心要点"。\n'
         "7. 结尾写一段总结，回顾全文核心知识体系，并展望相关方向。\n\n"
+        "数学公式（LaTeX）：\n"
+        "8. 如果原文涉及数学公式、算法复杂度、统计学公式、物理公式等，请使用 LaTeX 语法呈现。\n"
+        "9. 行内公式用 `$...$` 包裹，独立公式用 `$$...$$` 包裹。例如：时间复杂度 $O(n \\log n)$，贝叶斯公式：$$P(A|B) = \\frac{P(B|A)P(A)}{P(B)}$$\n"
+        "10. 代码块内不要使用 LaTeX（代码里的 $ 符号不会被渲染为公式）。\n\n"
         "内容展开原则：\n"
-        "8. 保留原视频的所有事实、数据、概念和论证顺序，**不编造**具体人名、机构名、数字或案例。\n"
-        "9. 对原文讲得简略的观点，结合常识和领域知识适度展开：补充背景、解释概念、拆解因果关系、说明影响和适用场景。\n"
-        '10. 凡是推断性补充，使用"可以理解为""这意味着""从这个角度看"等表达，避免伪装成原文明说。\n'
-        "11. 可以加入通俗类比帮助理解，但不要写成原文中出现过的真实案例。\n"
-        "12. 去掉口头禅、重复表达和无意义停顿。\n"
-        "13. 如果原文是外语，先理解原意再用自然简体中文改写，专有名词保留原文并附简体中文解释。\n"
-        "14. 如果转写稿里有明显不确定或疑似识别错误的内容，用括号标注（待核对）。\n"
-        "15. 每个小节覆盖原文该主题下的所有信息点；信息密集时使用 #### 子标题分点展开，不允许省略任何原文事实或观点。\n\n"
+        "11. 保留原视频的所有事实、数据、概念和论证顺序，**不编造**具体人名、机构名、数字或案例。\n"
+        "12. 对原文讲得简略的观点，结合常识和领域知识适度展开：补充背景、解释概念、拆解因果关系、说明影响和适用场景。\n"
+        '13. 凡是推断性补充，使用"可以理解为""这意味着""从这个角度看"等表达，避免伪装成原文明说。\n'
+        "14. 可以加入通俗类比帮助理解，但不要写成原文中出现过的真实案例。\n"
+        "15. 去掉口头禅、重复表达和无意义停顿。\n"
+        "16. 如果原文是外语，先理解原意再用自然简体中文改写，专有名词保留原文并附简体中文解释。\n"
+        "17. 如果转写稿里有明显不确定或疑似识别错误的内容，用括号标注（待核对）。\n"
+        "18. 每个小节覆盖原文该主题下的所有信息点；信息密集时使用 #### 子标题分点展开，不允许省略任何原文事实或观点。\n\n"
         f"转写稿：\n{transcript}"
     )
 
 
-def request_deepseek_article(transcript: str, job: Job) -> str:
+def request_deepseek_article(transcript: str, job: Job, page_label: str = "") -> str:
+    check_cancelled(job)
+
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("缺少 DEEPSEEK_API_KEY，无法调用 DeepSeek 整理文章。")
@@ -684,28 +1077,69 @@ def request_deepseek_article(transcript: str, job: Job) -> str:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你是一名资深中文技术编辑，擅长把任何语言的视频转写稿整理成内容详实、有图表有表格、结构清晰的简体中文技术长文。你善于用表格对比信息，用 ASCII 图表可视化流程，用引用块提炼要点。你必须全程使用简体中文，不得出现繁体中文。"},
+            {"role": "system", "content": "你是一名资深中文技术编辑，擅长把任何语言的视频转写稿整理成内容详实、有图表有表格、结构清晰的简体中文技术长文。你善于用表格对比信息，用 Mermaid 图表可视化流程与架构，用引用块提炼要点，用 LaTeX 数学公式（$...$ 行内、$$...$$ 独立）呈现数学内容。你必须全程使用简体中文，不得出现繁体中文。"},
             {"role": "user", "content": build_article_prompt(transcript)},
         ],
         "stream": False,
         "max_tokens": 32768,
     }
-    request = urllib.request.Request(
-        DEEPSEEK_API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    job.log(f"正在调用 DeepSeek 整理文章：{model}", 80)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    job.log(f"{page_label}正在调用 DeepSeek 整理文章：{model}", 80)
+
+    # 注册可取消的 session，主线程轮询 DB 取消状态时可以关闭连接
+    cancel_event = threading.Event()
+    session = requests.Session()
+    with _cancel_lock:
+        _cancel_sessions[job.id] = (cancel_event, session)
+
+    result: list[dict | None] = [None]
+    error: list[Exception | None] = [None]
+
+    def _do_request() -> None:
+        try:
+            resp = session.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=180)
+            resp.raise_for_status()
+            result[0] = resp.json()
+        except Exception as e:
+            error[0] = e
+
+    thread = threading.Thread(target=_do_request, daemon=True)
+    thread.start()
+
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"DeepSeek 接口返回错误：HTTP {exc.code} {body}") from exc
+        # 主线程每 0.5s 检查一次取消状态
+        while thread.is_alive():
+            thread.join(timeout=0.5)
+            check_cancelled(job)
+            if cancel_event.is_set():
+                raise JobCancelledError()
+
+        if error[0] is not None:
+            if isinstance(error[0], requests.exceptions.ConnectionError):
+                # 连接被 session.close() 关闭 → 很可能是取消触发的
+                check_cancelled(job)
+            if isinstance(error[0], requests.exceptions.HTTPError):
+                body = ""
+                try:
+                    body = error[0].response.text[:500]
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"DeepSeek 接口返回错误：HTTP {error[0].response.status_code} {body}"
+                ) from error[0]
+            raise RuntimeError(f"DeepSeek 接口调用失败：{error[0]}") from error[0]
+
+        data = result[0]
+        if data is None:
+            raise RuntimeError("DeepSeek 返回结果为空。")
+    finally:
+        with _cancel_lock:
+            _cancel_sessions.pop(job.id, None)
+        session.close()
 
     choices = data.get("choices") or []
     article = ""
@@ -714,109 +1148,24 @@ def request_deepseek_article(transcript: str, job: Job) -> str:
         article = str(message.get("content") or "").strip()
     if not article:
         raise RuntimeError("DeepSeek 返回结果为空。")
+    article = repair_article_markdown(article)
     return article
 
 
-def fallback_article(transcript: str) -> str:
-    clean_lines = []
-    for line in transcript.splitlines():
-        text = re.sub(r"^\[[^\]]+\]\s*", "", line).strip()
-        if text:
-            clean_lines.append(text)
-    body = "\n\n".join(chunk_text("".join(clean_lines), 900))
-    return (
-        "# 视频内容整理\n\n"
-        "## 摘要\n\n"
-        "当前未配置大模型接口，以下是基于转写稿生成的基础整理稿，可在配置 DEEPSEEK_API_KEY 后重新生成更完整文章。\n\n"
-        "## 正文\n\n"
-        f"{body}\n\n"
-        "## 备注\n\n"
-        "此版本仅做基础清理和分段，没有进行深度改写。"
-    )
-
-
-def chunk_text(text: str, size: int) -> list[str]:
-    return [text[index : index + size] for index in range(0, len(text), size)] or [""]
-
-
-def job_worker() -> None:
-    while True:
-        with queue_condition:
-            while not job_queue:
-                queue_condition.wait()
-            job = job_queue.pop(0)
-        process_job(job)
-
-
 def process_job(job: Job) -> None:
-    with jobs_lock:
-        job.status = "running"
-        job.log("任务已开始", 5)
+    job.status = "running"
+    job.log("任务已开始", 5)
 
     try:
-        bvid = extract_bvid(job.url)
-        cached = find_cached_output(bvid)
-        if cached:
-            transcript = (cached / "transcript.txt").read_text(encoding="utf-8")
-            article = (cached / "article.md").read_text(encoding="utf-8")
-            if not article.startswith("> 原视频链接："):
-                article = f"> 原视频链接：{job.url}\n\n{article}"
-            job.output_dir = str(cached)
-            job.transcript = transcript
-            job.article = article
-            job.status = "done"
-            job.log(f"复用缓存: {cached}", 100)
-            return
-
-        job._stage_begin()
-        view_data, headers = fetch_bilibili_view(job.url, job)
-        job._stage_end("获取视频信息")
-        title = view_data.get("data", {}).get("title") or bvid
-        dir_name = f"{time.strftime('%Y%m%d')}-{bvid}-{sanitize_filename(title)}"
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        out_dir = OUTPUT_DIR / dir_name
-        out_dir.mkdir(parents=True, exist_ok=True)
-        job.output_dir = str(out_dir)
-
-        job._stage_begin()
-        transcript = fetch_bilibili_subtitle(job.url, out_dir, job, view_data, headers)
-        if transcript:
-            job._stage_end("字幕获取")
-            job.log("已获取字幕，跳过音频转写", 70)
-        else:
-            job._stage_end("字幕获取(无)")
-            job._stage_begin()
-            audio_path = download_audio(job.url, out_dir, job, view_data, headers)
-            ffmpeg_path = shutil.which("ffmpeg")
-            transcription_source = audio_path
-            if ffmpeg_path:
-                transcription_source = convert_for_transcription(audio_path, out_dir, job)
-            else:
-                job.log("未找到 ffmpeg，直接使用下载的音频进行转写", 35)
-            job._stage_end("音频下载")
-            job._stage_begin()
-            transcript = transcribe_with_faster_whisper(transcription_source, job)
-            job._stage_end("语音转写")
-        transcript_path = out_dir / "transcript.txt"
-        transcript_path.write_text(transcript, encoding="utf-8")
-        job.transcript = transcript
-        job.log("转写完成", 75)
-
-        job._stage_begin()
-        if os.getenv("DEEPSEEK_API_KEY", "").strip():
-            article = request_deepseek_article(transcript, job)
-        else:
-            job.log("未配置 DEEPSEEK_API_KEY，生成基础整理稿", 80)
-            article = fallback_article(transcript)
-        job._stage_end("AI 文章生成")
-
-        article_path = out_dir / "article.md"
-        article_with_source = f"> 原视频链接：{job.url}\n\n{article}"
-        article_path.write_text(article_with_source, encoding="utf-8")
-        job.article = article_with_source
-        job.status = "done"
-        job.log("任务完成", 100)
-        job.log(job.build_summary())
+        check_cancelled(job)
+        platform = identify_platform(job.url)
+        if platform == "bilibili":
+            _process_bilibili(job)
+        elif platform == "youtube":
+            _process_youtube(job)
+    except JobCancelledError:
+        job.status = "cancelled"
+        job.log("任务已被用户取消", job.progress)
     except Exception as exc:
         job.status = "error"
         job.error = str(exc)
@@ -824,8 +1173,413 @@ def process_job(job: Job) -> None:
         job.log(f"任务失败：{exc}\n{tb}", job.progress)
 
 
+def _process_bilibili(job: Job) -> None:
+    bvid = extract_bvid(job.url)
+    has_explicit_page = "p=" in urllib.parse.urlparse(job.url).query
+    # Only use cache for single-page videos without explicit page param
+    if not has_explicit_page:
+        cached = find_cached_output(bvid)
+        if cached:
+            transcript = (cached / "transcript.txt").read_text(encoding="utf-8")
+            article = (cached / "article.md").read_text(encoding="utf-8")
+            if not article.startswith("> 原视频链接："):
+                article = f"> 原视频链接：{job.url}\n\n{article}"
+            article = repair_article_markdown(article)
+            job.output_dir = str(cached)
+            job.transcript = transcript
+            job.article = article
+            job.status = "done"
+            job.log(f"复用缓存: {cached}", 100)
+            job.log(job.build_summary())
+            _auto_gdrive_upload(job, cached)
+            return
+
+    job._stage_begin()
+    view_data, headers = fetch_bilibili_view(job.url, job)
+    job._stage_end("获取视频信息")
+
+    pages = view_data.get("data", {}).get("pages") or []
+    total_title = view_data.get("data", {}).get("title") or bvid
+    job.title = total_title
+    total = len(pages)
+
+    page_index = extract_page_index(job.url)
+    if total <= 1:
+        # Single page video — process it directly
+        _process_bilibili_page(job, bvid, view_data, headers, pages, 0, total_title, "")
+        job.status = "done"
+        job.log("任务完成", 100)
+        job.log(job.build_summary())
+        if job.output_dir:
+            _auto_save_page(job, Path(job.output_dir))
+            _auto_gdrive_upload(job, Path(job.output_dir))
+    else:
+        # Multiple pages — ?p=N means "start from episode N to the end"
+        start_page = page_index if has_explicit_page else 0
+        if start_page >= total:
+            start_page = 0
+        remaining = total - start_page
+
+        if has_explicit_page:
+            job.log(f"从第 {start_page + 1} 集开始，共 {remaining} 集待处理", 8)
+        else:
+            job.log(f"共 {total} 个分P，开始逐集处理", 8)
+
+        all_transcripts: list[str] = []
+        all_articles: list[str] = []
+        all_output_dirs: list[Path] = []
+        for i in range(start_page, total):
+            if _db.is_job_cancelled(job.id):
+                job.status = "cancelled"
+                job.log("任务已被用户取消", job.progress)
+                break
+            if i > start_page:
+                job._stage_begin()
+            label = f"[{i + 1}/{total}] "
+            # Clear previous page's transcript/article so the UI doesn't show stale content
+            # while the current page is being processed.
+            job.transcript = ""
+            job.article = ""
+            job.log(f"{label}处理第 {i + 1} 页", 10)
+            _process_bilibili_page(job, bvid, view_data, headers, pages, i, total_title,
+                                   page_label=label)
+            all_transcripts.append(job.transcript)
+            all_articles.append(job.article)
+            all_output_dirs.append(Path(job.output_dir))
+
+            # 处理完一集就立即上传、保存，不等全部完成
+            _auto_gdrive_upload(job, Path(job.output_dir))
+            _auto_save_page(job, Path(job.output_dir))
+
+        root_dir = Path(job.output_dir).parent if job.output_dir else OUTPUT_DIR
+        if all_transcripts:
+            combined = "\n\n---\n\n".join(all_transcripts)
+            (root_dir / "transcript-all.txt").write_text(combined, encoding="utf-8")
+            job.transcript = combined
+            job.article = "\n\n---\n\n".join(all_articles)
+        if job.status == "cancelled":
+            job.log(f"已取消，已完成第 {start_page + 1}-{start_page + len(all_transcripts)} 集")
+        else:
+            job.status = "done"
+            first, last = start_page + 1, total
+            job.log(f"全部处理完成（第 {first}-{last} 集）", 100)
+            job.log(job.build_summary())
+
+        # Store per-page data for save_job_article()
+        job.page_output_dirs = [str(d) for d in all_output_dirs]
+        job.page_articles = all_articles
+        return
+
+
+def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
+                           pages: list, page_index: int, total_title: str,
+                           page_label: str = "") -> None:
+    """Process a single page/episode of a Bilibili video."""
+    check_cancelled(job)
+
+    page = pages[page_index]
+    cid = page["cid"]
+    page_title = page.get("part") or f"P{page_index + 1}"
+    job.title = page_title or total_title
+
+    # 合集/分P视频：文件名前加上合集名（多分P用视频总标题，单集用 ugc_season 标题）
+    collection = ""
+    if len(pages) > 1:
+        collection = total_title
+    else:
+        season = view_data.get("data", {}).get("ugc_season") or {}
+        collection = season.get("title") or ""
+    stem = sanitize_filename(page_title)
+    collection_stem = sanitize_filename(collection) if collection else ""
+    if collection_stem and collection_stem != stem:
+        stem = f"{collection_stem}-{stem}"
+    dir_name = f"{stem[:180]}-{time.strftime('%Y%m%d')}-{bvid}-p{page_index + 1}"
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    out_dir = OUTPUT_DIR / dir_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    job.output_dir = str(out_dir)
+
+    job._stage_begin()
+    transcript = _fetch_page_subtitle(bvid, cid, out_dir, job, headers)
+    if transcript:
+        job._stage_end("字幕获取")
+        job.log(f"{page_label}已获取字幕，跳过音频转写", 70)
+    else:
+        job._stage_end("字幕获取(无)")
+        job._stage_begin()
+        audio_path = _download_page_audio(bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers, page_label)
+        ffmpeg_path = shutil.which("ffmpeg")
+        transcription_source = audio_path
+        if ffmpeg_path:
+            transcription_source = convert_for_transcription(audio_path, out_dir, job)
+        else:
+            job.log(f"{page_label}未找到 ffmpeg，直接使用下载的音频进行转写", 35)
+        job._stage_end("音频下载")
+        job._stage_begin()
+        transcript = transcribe_with_faster_whisper(transcription_source, job, page_label)
+        job._stage_end("语音转写")
+
+    transcript_path = out_dir / "transcript.txt"
+    transcript_path.write_text(transcript, encoding="utf-8")
+    job.transcript = transcript
+    job.log(f"{page_label}转写完成", 75)
+
+    job._stage_begin()
+    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法生成文章。请在 .env.local 中设置后重试。")
+    article = request_deepseek_article(transcript, job, page_label)
+    job._stage_end("AI 文章生成")
+
+    page_url = f"https://www.bilibili.com/video/{bvid}/?p={page_index + 1}"
+    article_path = out_dir / "article.md"
+    article_with_source = f"> 原视频链接：{page_url}\n\n{article}"
+    article_path.write_text(article_with_source, encoding="utf-8")
+    job.article = article_with_source
+    job.log(f"{page_label}{page_title} 完成", 85)
+
+
+def _fetch_page_subtitle(bvid: str, cid: int, out_dir: Path, job: Job,
+                          headers: dict) -> str | None:
+    """Fetch subtitle for a specific page CID."""
+    try:
+        player = bilibili_json(
+            BILIBILI_PLAYER_V2_API, {"bvid": bvid, "cid": str(cid)},
+            headers, "播放器字幕接口",
+        )
+        subtitles = player.get("data", {}).get("subtitle", {}).get("subtitles") or []
+        if not subtitles:
+            return None
+        subtitle = pick_subtitle(subtitles)
+        subtitle_url = subtitle.get("subtitle_url") or subtitle.get("url")
+        if not subtitle_url:
+            return None
+        if subtitle_url.startswith("//"):
+            subtitle_url = "https:" + subtitle_url
+        data = http_get(subtitle_url, {**headers, "Accept": "application/json, text/plain, */*"})
+        raw_path = out_dir / "subtitle.json"
+        raw_path.write_bytes(data)
+        payload = json.loads(data.decode("utf-8"))
+        body = payload.get("body") or []
+        lines = []
+        for item in body:
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            start = format_timestamp(float(item.get("from", 0)))
+            end = format_timestamp(float(item.get("to", 0)))
+            lines.append(f"[{start} - {end}] {content}")
+        return "\n".join(lines) if lines else None
+    except Exception:
+        return None
+
+
+def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
+                          job: Job, headers: dict, page_label: str) -> Path:
+    """Download audio for a specific page CID."""
+    job.log(f"{page_label}正在获取音频流", 20)
+
+    last_error = None
+    params: dict[str, str] = {"bvid": bvid, "cid": str(cid), "fnval": "4048", "fourk": "1"}
+    play_data = None
+    for api_url in BILIBILI_PLAYURL_APIS:
+        try:
+            play_data = bilibili_json(api_url, params, headers, "播放地址接口")
+            break
+        except RuntimeError as exc:
+            last_error = exc
+    if play_data is None:
+        raise RuntimeError(f"无法获取播放地址：{last_error}")
+
+    audio_stream = pick_audio_stream(play_data)
+    audio_url = audio_stream.get("baseUrl") or audio_stream.get("base_url")
+    if not audio_url:
+        raise RuntimeError("播放地址接口没有返回音频 URL。")
+
+    extension = audio_extension(audio_stream, audio_url)
+    audio_path = out_dir / f"{sanitize_filename(title)}.{extension}"
+    job.log(f"{page_label}正在下载音频", 25)
+    download_file(audio_url, audio_path, headers, job)
+    return audio_path
+
+
+def _local_save_format(cfg: dict) -> str:
+    """读取本地保存格式配置：pdf / html / both，默认 pdf（兼容旧配置）。"""
+    fmt = str(cfg.get("save_format", "pdf")).strip().lower()
+    return fmt if fmt in ("pdf", "html", "both") else "pdf"
+
+
+def _write_article_by_format(article: str, stem_path: Path, fmt: str) -> list[Path]:
+    """按保存格式生成 PDF / HTML 文件，返回生成的文件路径列表。"""
+    written: list[Path] = []
+    if fmt in ("pdf", "both"):
+        pdf_path = stem_path.with_suffix(".pdf")
+        write_article_pdf(article, pdf_path)
+        written.append(pdf_path)
+    if fmt in ("html", "both"):
+        html_path = stem_path.with_suffix(".html")
+        write_article_html(article, html_path)
+        written.append(html_path)
+    return written
+
+
+def _auto_save_page(job: Job, out_dir: Path) -> None:
+    """Save a single page's article as MD + PDF/HTML locally if auto_save is enabled."""
+    cfg = load_config()
+    if not cfg.get("auto_save"):
+        return
+
+    article = job.article
+    if not article.strip():
+        return
+
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    stem = out_dir.name
+
+    try:
+        md_path = DOCS_DIR / f"{stem}.md"
+        md_path.write_text(article, encoding="utf-8")
+        written = _write_article_by_format(article, DOCS_DIR / stem, _local_save_format(cfg))
+        job.log(f"已保存本地：{', '.join(str(p) for p in written)}")
+
+        pdf_dir_resolved = str(cfg.get("pdf_dir", "")).strip()
+        if pdf_dir_resolved:
+            extra_dir = Path(pdf_dir_resolved)
+            if cfg.get("date_subdir"):
+                extra_dir = extra_dir / time.strftime("%Y%m%d")
+            extra_dir.mkdir(parents=True, exist_ok=True)
+            for p in written:
+                shutil.copy2(p, extra_dir / p.name)
+    except Exception as exc:
+        job.log(f"⚠️ 本地保存失败：{exc}")
+
+
+def _auto_gdrive_upload(job: Job, out_dir: Path) -> None:
+    """Upload article (HTML or PDF) to Google Drive if configured."""
+    cfg = load_config()
+    if not cfg.get("gdrive_enabled"):
+        return
+    try:
+        gdrive_format = str(cfg.get("gdrive_format", "html")).strip().lower()
+        gdrive_folder = str(cfg.get("gdrive_folder_id", "")).strip()
+        use_date_subdir = bool(cfg.get("date_subdir"))
+        stem = out_dir.name
+
+        if gdrive_format == "html":
+            html_path = out_dir / f"{stem}.html"
+            if not html_path.exists():
+                write_article_html(job.article, html_path)
+            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir)
+            if err:
+                return job.log(f"⚠️ Drive 上传失败：{err.get('message', '')}")
+            result = gdrive_upload_file(str(html_path), parent_folder_id=target_folder, mime_type="text/html")
+        else:
+            pdf_path = out_dir / f"{stem}.pdf"
+            if not pdf_path.exists():
+                write_article_pdf(job.article, pdf_path)
+            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir)
+            if err:
+                return job.log(f"⚠️ Drive 上传失败：{err.get('message', '')}")
+            result = gdrive_upload_file(str(pdf_path), parent_folder_id=target_folder, mime_type="application/pdf")
+
+        if result.get("status") == "success":
+            d = result["data"]
+            job.log(f"已上传到 Google Drive：{d['name']} ({d['webViewLink']})")
+        else:
+            job.log(f"⚠️ Drive 上传失败：{result.get('message', '')}")
+    except Exception as exc:
+        job.log(f"⚠️ Drive 上传异常：{exc}")
+
+
+def _resolve_gdrive_folder(folder_id: str, date_subdir: bool) -> tuple[str, dict | None]:
+    """Resolve target folder ID, with optional date sub-directory."""
+    from gdrive_uploader import find_or_create_folder, _resolve_folder_id
+    target_folder, err = _resolve_folder_id(folder_id)
+    if err:
+        return "", err
+    if date_subdir:
+        date_name = time.strftime("%Y%m%d")
+        found_id, err = find_or_create_folder(date_name, target_folder or "")
+        if err:
+            return "", err
+        target_folder = found_id or folder_id
+    return target_folder or "", None
+
+
+def _process_youtube(job: Job) -> None:
+    yt_id = extract_youtube_id(job.url)
+    cached = find_cached_output_yt(yt_id)
+    if cached:
+        transcript = (cached / "transcript.txt").read_text(encoding="utf-8")
+        article = (cached / "article.md").read_text(encoding="utf-8")
+        if not article.startswith("> 原视频链接："):
+            article = f"> 原视频链接：{job.url}\n\n{article}"
+        article = repair_article_markdown(article)
+        job.output_dir = str(cached)
+        job.transcript = transcript
+        job.article = article
+        job.status = "done"
+        job.log(f"复用缓存: {cached}", 100)
+        job.log(job.build_summary())
+        _auto_gdrive_upload(job, cached)
+        return
+
+    check_cancelled(job)
+    job._stage_begin()
+    info = fetch_youtube_info(job.url, job)
+    job._stage_end("获取视频信息")
+    title = info.get("title") or yt_id
+    job.title = title
+    dir_name = f"{sanitize_filename(title)}-{time.strftime('%Y%m%d')}-youtube-{yt_id}"
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    out_dir = OUTPUT_DIR / dir_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    job.output_dir = str(out_dir)
+
+    job._stage_begin()
+    transcript = fetch_youtube_subtitle(job.url, out_dir, job, info)
+    if transcript:
+        job._stage_end("字幕获取")
+        job.log("已获取字幕，跳过音频转写", 70)
+    else:
+        job._stage_end("字幕获取(无)")
+        job._stage_begin()
+        audio_path = download_youtube_audio(job.url, out_dir, job, info)
+        ffmpeg_path = shutil.which("ffmpeg")
+        transcription_source = audio_path
+        if ffmpeg_path:
+            transcription_source = convert_for_transcription(audio_path, out_dir, job)
+        else:
+            job.log("未找到 ffmpeg，直接使用下载的音频进行转写", 35)
+        job._stage_end("音频下载")
+        job._stage_begin()
+        transcript = transcribe_with_faster_whisper(transcription_source, job)
+        job._stage_end("语音转写")
+    transcript_path = out_dir / "transcript.txt"
+    transcript_path.write_text(transcript, encoding="utf-8")
+    job.transcript = transcript
+    job.log("转写完成", 75)
+
+    job._stage_begin()
+    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，无法生成文章。请在 .env.local 中设置后重试。")
+    article = request_deepseek_article(transcript, job)
+    job._stage_end("AI 文章生成")
+
+    article_path = out_dir / "article.md"
+    article_with_source = f"> 原视频链接：{job.url}\n\n{article}"
+    article_path.write_text(article_with_source, encoding="utf-8")
+    job.article = article_with_source
+    job.status = "done"
+    job.log("任务完成", 100)
+    job.log(job.build_summary())
+
+    # Auto-save local docs and upload to Google Drive if enabled
+    _auto_save_page(job, out_dir)
+    _auto_gdrive_upload(job, out_dir)
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BilibiliScraper/0.1"
+    server_version = "VideoScraper/0.2"
 
     def do_GET(self) -> None:
         if self.path == "/" or self.path.startswith("/?"):
@@ -833,14 +1587,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/config":
             cfg = load_config()
+            gdrive_authed = False
+            try:
+                gdrive_authed = gdrive_is_authenticated()
+            except Exception:
+                pass
+            # Worker 心跳检测：最近 10 秒内有心跳则认为在线
+            hb = _db.get_worker_heartbeat()
+            worker_alive = hb is not None and (time.time() - hb) < 10
             self.send_json(
                 {
                     "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
                     "deepseek_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
-                    "whisper_device": os.getenv("WHISPER_DEVICE", "cuda"),
+                    "whisper_device": os.getenv("WHISPER_DEVICE", "auto"),
                     "pdf_dir": cfg.get("pdf_dir", ""),
                     "auto_save": cfg.get("auto_save", False),
                     "date_subdir": cfg.get("date_subdir", False),
+                    "save_format": _local_save_format(cfg),
+                    "youtube_cookie_configured": bool(str(cfg.get("youtube_cookie", "")).strip()),
+                    "gdrive_enabled": bool(cfg.get("gdrive_enabled")),
+                    "gdrive_folder_id": str(cfg.get("gdrive_folder_id", "")).strip(),
+                    "gdrive_format": str(cfg.get("gdrive_format", "html")).strip(),
+                    "gdrive_authenticated": gdrive_authed,
+                    "worker_alive": worker_alive,
                 }
             )
             return
@@ -850,9 +1619,38 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/styles.css":
             self.send_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
             return
+        if self.path == "/api/jobs/" or self.path == "/api/jobs":
+            self.send_json(_db.list_all_jobs())
+            return
         if self.path.startswith("/api/jobs/"):
             job_id = self.path.rsplit("/", 1)[-1]
-            self.send_json(job_snapshot(job_id))
+            snap = _db.get_job_snapshot(job_id)
+            if snap is None:
+                self.send_json({"error": "任务不存在"}, status=HTTPStatus.NOT_FOUND)
+            else:
+                self.send_json(snap)
+            return
+        if self.path == "/api/gdrive/status":
+            try:
+                authed = gdrive_is_authenticated()
+            except Exception:
+                authed = False
+            self.send_json({"authenticated": authed})
+            return
+        if self.path.startswith("/api/gdrive/callback"):
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            code = query.get("code", [""])[0]
+            state = query.get("state", [""])[0]
+            if not code:
+                self.send_html_page("授权失败", "未收到 Google 的授权码，请重试。")
+                return
+            success, message = gdrive_exchange_code(code, state)
+            self.send_html_page(
+                "授权成功" if success else "授权失败",
+                message,
+                auto_close=success,
+            )
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -866,12 +1664,102 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["pdf_dir"] = str(body.get("pdf_dir", "")).strip()
                     cfg["auto_save"] = bool(body.get("auto_save"))
                     cfg["date_subdir"] = bool(body.get("date_subdir"))
+                    if "save_format" in body:
+                        cfg["save_format"] = _local_save_format(
+                            {"save_format": body.get("save_format")}
+                        )
+                    if "youtube_cookie" in body:
+                        cfg["youtube_cookie"] = str(body.get("youtube_cookie", "")).strip()
+                    if "gdrive_enabled" in body:
+                        cfg["gdrive_enabled"] = bool(body.get("gdrive_enabled"))
+                    if "gdrive_folder_id" in body:
+                        cfg["gdrive_folder_id"] = str(body.get("gdrive_folder_id", "")).strip()
+                    if "gdrive_format" in body:
+                        cfg["gdrive_format"] = str(body.get("gdrive_format", "html")).strip()
                     save_config(cfg)
                     self.send_json({"ok": True})
                     return
                 except json.JSONDecodeError:
                     pass
             self.send_json({"ok": False, "error": "无效请求"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/api/youtube-login" and self.command == "POST":
+            try:
+                from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+            except ImportError:
+                self.send_json(
+                    {"ok": False, "error": "请先安装 playwright：pip install playwright"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+
+            user_data_dir = ROOT / ".browser-data"
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch_persistent_context(
+                        str(user_data_dir),
+                        headless=False,
+                        channel="chrome",
+                        locale="zh-CN",
+                    )
+                    page = browser.pages[0] if browser.pages else browser.new_page()
+                    page.goto("https://www.youtube.com/", wait_until="domcontentloaded")
+
+                    # 等待登录：检测用户头像/账号按钮出现，最多等 5 分钟
+                    try:
+                        page.wait_for_selector(
+                            '#avatar-btn, ytd-account-button, button[aria-label*="Google"], '
+                            'ytd-active-account-header-renderer, #account-button',
+                            timeout=300_000,
+                        )
+                    except PlaywrightTimeout:
+                        browser.close()
+                        self.send_json(
+                            {"ok": False, "error": "登录超时（5 分钟），请重试"},
+                            status=HTTPStatus.REQUEST_TIMEOUT,
+                        )
+                        return
+
+                    cookies = browser.cookies()
+                    browser.close()
+            except Exception as exc:
+                self.send_json(
+                    {"ok": False, "error": f"启动浏览器失败: {exc}"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+
+            cookie_str = "; ".join(
+                f"{c['name']}={c['value']}"
+                for c in cookies
+                if c.get("domain", "").endswith("youtube.com")
+            )
+            if not cookie_str:
+                self.send_json(
+                    {"ok": False, "error": "未获取到 YouTube cookie，请确认已登录"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+
+            cfg = load_config()
+            cfg["youtube_cookie"] = cookie_str
+            save_config(cfg)
+            self.send_json({"ok": True})
+            return
+
+        if self.path.startswith("/api/jobs/") and self.path.endswith("/cancel"):
+            job_id = self.path.rsplit("/", 2)[-2]
+            ok = _db.cancel_job(job_id)
+            self.send_json({"ok": ok, "id": job_id})
+            return
+
+        if self.path.startswith("/api/jobs/") and self.path.endswith("/delete"):
+            job_id = self.path.rsplit("/", 2)[-2]
+            ok = _db.delete_job(job_id)
+            self.send_json({"ok": ok, "id": job_id})
             return
 
         if self.path.startswith("/api/jobs/") and self.path.endswith("/save-doc"):
@@ -894,6 +1782,41 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
 
+        if self.path.startswith("/api/jobs/") and self.path.endswith("/save-local"):
+            job_id = self.path.split("/")[-2]
+            try:
+                self.send_json(save_job_local(job_id))
+            except RuntimeError as exc:
+                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path.startswith("/api/jobs/") and self.path.endswith("/save-drive"):
+            job_id = self.path.split("/")[-2]
+            try:
+                self.send_json(upload_job_to_drive(job_id))
+            except RuntimeError as exc:
+                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path.startswith("/api/jobs/") and self.path.endswith("/retry"):
+            job_id = self.path.rsplit("/", 2)[-2]
+            ok = _db.retry_job(job_id)
+            if ok:
+                self.send_json({"ok": True, "id": job_id})
+            else:
+                self.send_json({"ok": False, "error": "任务不存在或状态不允许重试"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path == "/api/gdrive/auth-url":
+            try:
+                auth_url, state = gdrive_get_auth_url()
+                self.send_json({"url": auth_url, "state": state})
+            except FileNotFoundError as exc:
+                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            except Exception as exc:
+                self.send_json({"error": f"生成授权链接失败：{exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         if self.path != "/api/jobs":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -906,20 +1829,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         url = str(payload.get("url", "")).strip()
-        if not url.startswith(("http://", "https://")) or "bilibili.com" not in url:
-            self.send_error(HTTPStatus.BAD_REQUEST, "请输入有效的 Bilibili URL")
+        # Auto-prepend https:// if user pasted a bare URL
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if not url.startswith(("http://", "https://")) or not ("bilibili.com" in url or "youtube.com" in url or "youtu.be" in url):
+            self.send_error(HTTPStatus.BAD_REQUEST, "请输入有效的 Bilibili 或 YouTube URL")
             return
 
         cookie_string = str(payload.get("cookie", "")).strip()
-        job = Job(id=uuid.uuid4().hex[:12], url=url, cookie_string=cookie_string)
-        with jobs_lock:
-            jobs[job.id] = job
-        job.stage = "排队等待"
-        job.log("已加入任务队列", 0)
-        with queue_condition:
-            job_queue.append(job)
-            queue_condition.notify()
-        self.send_json({"id": job.id})
+        job_id = uuid.uuid4().hex[:12]
+        try:
+            _db.create_job(job_id=job_id, url=url, cookie_string=cookie_string)
+        except Exception as exc:
+            self.send_json({"error": f"创建任务失败：{exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self.send_json({"id": job_id})
 
     def send_file(self, path: Path, content_type: str) -> None:
         if not path.exists():
@@ -940,76 +1864,577 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_html_page(self, title: str, message: str, auto_close: bool = False) -> None:
+        js_close = "<script>window.close();</script>" if auto_close else ""
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, "SF Pro Display", "Segoe UI", sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh;
+         margin:0; background:#f5f3ef; color:#1e2528; }}
+  .card {{ background:#fff; border-radius:12px; padding:32px 40px; box-shadow:0 4px 24px rgba(0,0,0,.08);
+           text-align:center; max-width:420px; }}
+  h2 {{ margin:0 0 8px; font-size:20px; }}
+  p {{ color:#667175; line-height:1.6; }}
+  .icon {{ font-size:48px; margin-bottom:12px; }}
+</style></head>
+<body><div class="card">
+  <div class="icon">{'✅' if auto_close else '❌'}</div>
+  <h2>{title}</h2><p>{message}</p>
+</div>{js_close}</body></html>"""
+        data = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{self.address_string()} - {fmt % args}"
+        msg = f"{self.client_address[0]} - {fmt % args}"
         with open(ACCESS_LOG, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
 
 
-def job_snapshot(job_id: str) -> dict[str, Any]:
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            return {"error": "任务不存在"}
-        return {
-            "id": job.id,
-            "url": job.url,
-            "status": job.status,
-            "stage": job.stage,
-            "logs": job.logs[-200:],
-            "progress": job.progress,
-            "transcript": job.transcript,
-            "article": job.article,
-            "error": job.error,
-            "output_dir": job.output_dir,
-            "created_at": job.created_at,
-            "updated_at": job.updated_at,
-            "elapsed": int(time.time() - job.created_at) if job.status in ("running", "queued") else 0,
-        }
+def _job_article_items(job: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return [(out_dir, article)] — one per page for multi-page jobs."""
+    page_dirs = list(job.get("page_output_dirs") or [])
+    page_articles_list = list(job.get("page_articles") or [])
+    if page_dirs and page_articles_list:
+        return list(zip(page_dirs, page_articles_list))
+    return [(job["output_dir"], job["article"])]
 
 
-def save_job_article(job_id: str, pdf_dir: str | None = None, date_subdir: bool = False) -> dict[str, Any]:
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if not job:
-            raise RuntimeError("任务不存在")
-        if job.status != "done" or not job.article.strip():
-            raise RuntimeError("文章尚未生成，无法保存")
-        article = job.article
-        output_dir = job.output_dir
+def save_job_local(job_id: str, pdf_dir: str | None = None, date_subdir: bool = False) -> dict[str, Any]:
+    """Save a finished job's article(s) as MD + PDF/HTML under docs/ (and the
+    configured extra pdf_dir).  Local only — no Google Drive upload."""
+    job = _db.get_job(job_id)
+    if not job:
+        raise RuntimeError("任务不存在")
+    if job["status"] != "done" or not job["article"].strip():
+        raise RuntimeError("文章尚未生成，无法保存")
 
     t0 = time.time()
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    stem = Path(output_dir).name
-    md_path = DOCS_DIR / f"{stem}.md"
-    pdf_path = DOCS_DIR / f"{stem}.pdf"
-    md_path.write_text(article, encoding="utf-8")
-    write_article_pdf(article, pdf_path)
+    cfg = load_config()
+    fmt = _local_save_format(cfg)
+    parts: list[str] = []
+    first_md_path = ""
+    first_file_path = ""
 
-    extra_info = ""
-    if pdf_dir:
-        extra_dir = Path(pdf_dir)
-        if date_subdir:
-            extra_dir = extra_dir / time.strftime("%Y%m%d")
-        extra_dir.mkdir(parents=True, exist_ok=True)
-        extra_pdf = extra_dir / f"{stem}.pdf"
-        shutil.copy2(pdf_path, extra_pdf)
-        extra_info = f"；额外保存到 {extra_pdf}"
+    for out_dir_item, art_item in _job_article_items(job):
+        stem = Path(out_dir_item).name
+        md_path = DOCS_DIR / f"{stem}.md"
+        md_path.write_text(art_item, encoding="utf-8")
+        written = _write_article_by_format(art_item, DOCS_DIR / stem, fmt)
+
+        if not first_md_path:
+            first_md_path = str(md_path)
+            first_file_path = str(written[0])
+
+        for p in written:
+            parts.append(f"📁 本地：{p}")
+
+        # 额外保存目录
+        pdf_dir_resolved = pdf_dir or str(cfg.get("pdf_dir", "")).strip()
+        if pdf_dir_resolved:
+            extra_dir = Path(pdf_dir_resolved)
+            if date_subdir or cfg.get("date_subdir"):
+                extra_dir = extra_dir / time.strftime("%Y%m%d")
+            extra_dir.mkdir(parents=True, exist_ok=True)
+            for p in written:
+                extra_file = extra_dir / p.name
+                shutil.copy2(p, extra_file)
+                parts.append(f"         → {extra_file}")
 
     elapsed = time.time() - t0
-    with jobs_lock:
-        job = jobs.get(job_id)
-        if job:
-            summary = f"═══ 文件保存 ═══\n  Markdown：{md_path}\n  PDF：{pdf_path}\n  保存耗时：{elapsed:.1f}s"
-            if extra_info:
-                summary += extra_info
-            job.log(summary, 100)
+    summary = f"═══ 输出 ({elapsed:.1f}s) ═══\n" + "\n".join(parts)
+    try:
+        _db.update_job_log(job_id, summary, 100)
+    except Exception:
+        pass
 
-    return {"path": str(md_path), "pdf_path": str(pdf_path)}
+    return {"ok": True, "path": first_md_path, "pdf_path": first_file_path}
+
+
+def upload_job_to_drive(job_id: str) -> dict[str, Any]:
+    """Upload a finished job's article(s) to Google Drive (HTML or PDF per
+    current config).  Handles multi-page jobs by uploading every page."""
+    job = _db.get_job(job_id)
+    if not job:
+        raise RuntimeError("任务不存在")
+    if job["status"] != "done" or not job["article"].strip():
+        raise RuntimeError("文章尚未生成，无法上传")
+    try:
+        authed = gdrive_is_authenticated()
+    except Exception:
+        authed = False
+    if not authed:
+        raise RuntimeError("Google Drive 未授权，请先在上方设置中完成授权")
+
+    cfg = load_config()
+    gdrive_format = str(cfg.get("gdrive_format", "html")).strip().lower()
+    gdrive_folder = str(cfg.get("gdrive_folder_id", "")).strip()
+    use_date_subdir = bool(cfg.get("date_subdir"))
+
+    links: list[str] = []
+    for out_dir_item, art_item in _job_article_items(job):
+        out_dir = Path(out_dir_item)
+        if not out_dir.name:
+            raise RuntimeError("任务缺少输出目录信息，无法上传")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = out_dir.name
+        if gdrive_format == "html":
+            file_path = out_dir / f"{stem}.html"
+            if not file_path.exists():
+                write_article_html(art_item, file_path)
+            mime_type = "text/html"
+        else:
+            file_path = out_dir / f"{stem}.pdf"
+            if not file_path.exists():
+                write_article_pdf(art_item, file_path)
+            mime_type = "application/pdf"
+
+        target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir)
+        if err:
+            raise RuntimeError(f"Drive 上传失败：{err.get('message', '')}")
+        result = gdrive_upload_file(str(file_path), parent_folder_id=target_folder, mime_type=mime_type)
+        if result.get("status") != "success":
+            raise RuntimeError(f"Drive 上传失败：{result.get('message', '')}")
+        links.append(result["data"]["webViewLink"])
+
+    try:
+        _db.update_job_log(job_id, f"已手动上传到 Google Drive（{len(links)} 个文件）：" + "、".join(links), 100)
+    except Exception:
+        pass
+    return {"ok": True, "count": len(links), "links": links}
+
+
+def save_job_article(job_id: str, pdf_dir: str | None = None, date_subdir: bool = False) -> dict[str, Any]:
+    """Combined save: local MD+PDF, plus Drive upload when enabled
+    (single-page only — multi-page pages were uploaded during processing)."""
+    result = save_job_local(job_id, pdf_dir, date_subdir)
+
+    job = _db.get_job(job_id)
+    cfg = load_config()
+    is_multi = bool(job and job.get("page_output_dirs") and job.get("page_articles"))
+
+    # ── Google Drive（多集已在处理结束时逐集上传，此处跳过避免重复）──
+    if cfg.get("gdrive_enabled") and not is_multi:
+        parts: list[str] = []
+        try:
+            upload = upload_job_to_drive(job_id)
+            parts.extend(f"☁️ Drive：{link}" for link in upload["links"])
+        except Exception as exc:
+            parts.append(f"⚠️ Drive 失败：{exc}")
+        try:
+            _db.update_job_log(job_id, "\n".join(parts), 100)
+        except Exception:
+            pass
+
+    return {"path": result["path"], "pdf_path": result["pdf_path"]}
+
+
+def write_article_html(article: str, path: Path) -> None:
+    """Convert markdown article to a responsive HTML page with LaTeX math
+    and Mermaid diagram support.
+
+    KaTeX renders $...$ (inline) and $$...$$ (display) math; ```mermaid
+    blocks render as SVG diagrams.  Both libraries load from CDN, so an
+    internet connection is needed when opening the page.  Code blocks are
+    excluded from math rendering.
+    """
+    try:
+        import markdown as md_lib
+    except ImportError:
+        raise RuntimeError("缺少 markdown 依赖。请执行：pip install markdown")
+
+    has_mermaid = "```mermaid" in article
+    html_body = md_lib.markdown(
+        article,
+        output_format="xhtml",
+        extensions=["tables", "fenced_code"],
+    )
+    title = ""
+    for line in article.splitlines():
+        line = line.strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            title = line[2:].strip()
+            break
+
+    if has_mermaid:
+        mermaid_assets = (
+            '<script defer src="https://cdn.staticfile.org/mermaid/10.9.3/mermaid.min.js"\n'
+            "        onload=\"mermaid.initialize({startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true});"
+            " mermaid.run({querySelector: 'pre code.language-mermaid'}).catch(function () {});\"></script>"
+        )
+    else:
+        mermaid_assets = ""
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title or '文章'}</title>
+<link rel="stylesheet" href="https://cdn.staticfile.org/KaTeX/0.16.11/katex.min.css">
+<script defer src="https://cdn.staticfile.org/KaTeX/0.16.11/katex.min.js"></script>
+<script defer src="https://cdn.staticfile.org/KaTeX/0.16.11/contrib/auto-render.min.js"
+        onload="renderMathInElement(document.body, {{delimiters: [
+            {{left: '\$\$', right: '\$\$', display: true}},
+            {{left: '\$', right: '\$', display: false}},
+        ], ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']}});"></script>
+{mermaid_assets}
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+                 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+    font-size: 17px; line-height: 1.85; color: #1a1a1a;
+    background: #fafaf8; padding: 24px 16px 60px;
+  }}
+  article {{
+    max-width: 680px; margin: 0 auto; background: #fff;
+    padding: 32px 24px; border-radius: 8px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  }}
+  h1 {{ font-size: 1.6em; margin: 1.2em 0 .6em; line-height: 1.4;
+        border-bottom: 1px solid #eee; padding-bottom: .3em; }}
+  h2 {{ font-size: 1.3em; margin: 1em 0 .5em; line-height: 1.4; }}
+  h3 {{ font-size: 1.1em; margin: .8em 0 .4em; }}
+  h4 {{ font-size: 1em; margin: .6em 0 .3em; }}
+  blockquote {{
+    margin: 1em 0; padding: .5em 1em; border-left: 4px solid #fb7299;
+    color: #555; background: #fdf6f8; border-radius: 0 4px 4px 0;
+  }}
+  blockquote p {{ margin: .3em 0; }}
+  p {{ margin: .8em 0; }}
+  a {{ color: #fb7299; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  ul, ol {{ margin: .6em 0; padding-left: 1.5em; }}
+  li {{ margin: .3em 0; }}
+  code {{
+    background: #f0f0f0; padding: 2px 6px; border-radius: 3px;
+    font-size: .9em; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  }}
+  pre {{
+    background: #f5f5f5; padding: 16px; border-radius: 6px;
+    overflow-x: auto; margin: 1em 0; font-size: .85em; line-height: 1.6;
+  }}
+  pre code {{ background: none; padding: 0; }}
+  pre:has(> code.language-mermaid) {{ background: #fff; text-align: center; }}
+  hr {{ border: none; border-top: 1px solid #eee; margin: 2em 0; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 1em 0; font-size: .9em; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
+  th {{ background: #f5f5f5; }}
+  /* KaTeX overrides for better inline alignment */
+  .katex {{ font-size: 1.05em !important; }}
+  .katex-display {{ margin: 1.2em 0; overflow-x: auto; overflow-y: hidden; }}
+  .katex-display > .katex {{ font-size: 1.1em !important; }}
+  @media (max-width: 500px) {{
+    body {{ padding: 8px 4px 40px; font-size: 16px; }}
+    article {{ padding: 20px 14px; border-radius: 4px; }}
+    .katex-display {{ font-size: .95em; }}
+  }}
+</style>
+</head>
+<body>
+<article>
+{html_body}
+</article>
+</body>
+</html>"""
+    path.write_text(html, encoding="utf-8")
+
+
+def _pdf_has_valid_content(pdf_path: Path, article: str) -> bool:
+    """Check if a generated PDF contains the expected Chinese text content.
+
+    Returns False if the PDF is suspiciously small or missing Chinese
+    characters, indicating a rendering failure (e.g. the macOS system
+    Chrome white-text bug).
+    """
+    if not pdf_path.exists():
+        return False
+    file_size = pdf_path.stat().st_size
+    # 只拦截明显损坏（几乎为空）的 PDF；短文章的正常 PDF 可能只有几十 KB，
+    # 真正的渲染失败由下面的中文字符检查兜底（白字 bug 的 PDF 提取不出文字）。
+    if file_size < 8 * 1024:
+        return False
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(str(pdf_path))
+        text = ""
+        for page in reader.pages[:3]:
+            text += (page.extract_text() or "")
+        # At least some Chinese characters should be present
+        chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        return chinese_chars >= 10
+    except Exception:
+        return True  # If we can't check, assume it's fine
 
 
 def write_article_pdf(article: str, path: Path) -> None:
+    """Convert markdown article to PDF, with LaTeX math support.
+
+    Uses Playwright (headless Chromium) to render a complete HTML page —
+    including KaTeX math — and print it to PDF.  Falls back to reportlab
+    when Playwright / Chromium is unavailable or produces invalid output.
+    """
+    try:
+        import markdown as md_lib
+    except ImportError:
+        raise RuntimeError("缺少 markdown 依赖。请执行：pip install markdown")
+
+    # Attempt Playwright first — renders CSS + JS (KaTeX) correctly.
+    playwright_ok = False
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout  # noqa: F401
+        _write_article_pdf_playwright(article, path, md_lib)
+        playwright_ok = _pdf_has_valid_content(path, article)
+    except (ImportError, Exception):
+        pass  # Fall through to reportlab
+
+    if not playwright_ok:
+        # reportlab fallback (no LaTeX math rendering, but tables / headings work).
+        _write_article_pdf_reportlab(article, path)
+
+
+_MATH_PLACEHOLDER = "KATEXMATHSEG{}Z"
+_MATH_SEGMENT_RE = re.compile(
+    r"```.*?```"        # fenced code block — kept intact, no math inside
+    r"|\$\$.+?\$\$"     # $$...$$
+    r"|\\\[.+?\\\]"     # \[ ... \]
+    r"|\\\(.+?\\\)"     # \( ... \)
+    r"|\$[^$\n]+?\$",   # $...$ (single line)
+    re.DOTALL,
+)
+
+
+def _protect_math_segments(text: str) -> tuple[str, list[str]]:
+    """Stash LaTeX math (and fenced code) behind plain-text placeholders.
+
+    Python-Markdown's backslash escaping would otherwise corrupt LaTeX
+    before KaTeX sees it: ``\\[`` becomes ``[`` and ``\\\\`` becomes ``\\``,
+    which breaks ``\\[...\\]`` blocks and ``\\\\`` line breaks inside math.
+    """
+    segments: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        segments.append(match.group(0))
+        return _MATH_PLACEHOLDER.format(len(segments) - 1)
+
+    return _MATH_SEGMENT_RE.sub(_stash, text), segments
+
+
+def _restore_math_segments(html_text: str, segments: list[str]) -> str:
+    """Put stashed segments back into the HTML.
+
+    Math segments are HTML-escaped so ``<``, ``>`` and ``&`` inside them
+    cannot break the markup.  Fenced code blocks are converted to
+    ``<pre><code>`` directly (the placeholder prevented the markdown
+    converter from seeing the fences)."""
+    import html as html_lib
+
+    for i, seg in enumerate(segments):
+        placeholder = _MATH_PLACEHOLDER.format(i)
+        if seg.startswith("```"):
+            body = seg[3:]
+            first_nl = body.find("\n")
+            info = body[:first_nl].strip() if first_nl != -1 else ""
+            body = body[first_nl + 1:] if first_nl != -1 else ""
+            if body.rstrip("\n").endswith("```"):
+                body = body.rstrip("\n")[:-3]
+            lang_cls = f' class="language-{info}"' if info else ""
+            code_html = (
+                f"<pre><code{lang_cls}>{html_lib.escape(body.strip(chr(10)), quote=False)}</code></pre>"
+            )
+            wrapped = f"<p>{placeholder}</p>"
+            if wrapped in html_text:
+                html_text = html_text.replace(wrapped, code_html)
+            else:
+                html_text = html_text.replace(placeholder, code_html)
+        else:
+            html_text = html_text.replace(
+                placeholder, html_lib.escape(seg, quote=False)
+            )
+    return html_text
+
+
+def _build_pdf_html(article: str, md_lib) -> str:
+    """Build a self-contained HTML page for PDF printing (A4, print-friendly).
+
+    KaTeX assets are loaded from the local ``vendor/katex`` directory so PDF
+    generation works without network access; falls back to the jsDelivr CDN
+    if the local files are missing.  Auto-render is *not* run in the HTML —
+    the caller (Playwright) calls renderMathInElement programmatically after
+    the page and all scripts have finished loading.
+    """
+    protected, math_segments = _protect_math_segments(article)
+    html_body = md_lib.markdown(
+        protected,
+        output_format="xhtml",
+        extensions=["tables", "fenced_code"],
+    )
+    html_body = _restore_math_segments(html_body, math_segments)
+    title = ""
+    for line in article.splitlines():
+        line = line.strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            title = line[2:].strip()
+            break
+
+    katex_dir = ROOT / "vendor" / "katex"
+    if all((katex_dir / name).exists() for name in ("katex.min.css", "katex.min.js", "auto-render.min.js")):
+        katex_css = (katex_dir / "katex.min.css").as_uri()
+        katex_js = (katex_dir / "katex.min.js").as_uri()
+        katex_auto = (katex_dir / "auto-render.min.js").as_uri()
+    else:
+        katex_css = "https://cdn.staticfile.org/KaTeX/0.16.11/katex.min.css"
+        katex_js = "https://cdn.staticfile.org/KaTeX/0.16.11/katex.min.js"
+        katex_auto = "https://cdn.staticfile.org/KaTeX/0.16.11/contrib/auto-render.min.js"
+
+    mermaid_script = ""
+    if "```mermaid" in article:
+        mermaid_path = ROOT / "vendor" / "mermaid" / "mermaid.min.js"
+        if mermaid_path.exists():
+            mermaid_script = f'<script src="{mermaid_path.as_uri()}"></script>'
+        else:
+            mermaid_script = '<script src="https://cdn.staticfile.org/mermaid/10.9.3/mermaid.min.js"></script>'
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{title or '文章'}</title>
+<link rel="stylesheet" href="{katex_css}">
+<script src="{katex_js}"></script>
+<script src="{katex_auto}"></script>
+{mermaid_script}
+<style>
+  @page {{ size: A4; margin: 20mm 18mm 20mm 18mm; }}
+  body {{
+    font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", "Noto Sans SC", sans-serif;
+    font-size: 11pt; line-height: 1.8; color: #1a1a1a;
+  }}
+  h1 {{ font-size: 1.5em; margin: 1em 0 .5em; border-bottom: 1px solid #ccc; padding-bottom: .3em; }}
+  h2 {{ font-size: 1.25em; margin: .9em 0 .4em; }}
+  h3 {{ font-size: 1.1em; margin: .7em 0 .3em; }}
+  h4 {{ font-size: 1em; margin: .5em 0 .2em; }}
+  p {{ margin: .6em 0; }}
+  blockquote {{
+    margin: .8em 0; padding: .4em 1em; border-left: 4px solid #fb7299;
+    color: #555; background: #fdf6f8; border-radius: 0 4px 4px 0;
+  }}
+  ul, ol {{ margin: .5em 0; padding-left: 1.5em; }}
+  li {{ margin: .2em 0; }}
+  code {{
+    background: #f0f0f0; padding: 1px 5px; border-radius: 3px;
+    font-size: .88em; font-family: "SF Mono", "Consolas", monospace;
+  }}
+  pre {{
+    background: #f5f5f5; padding: 12px; border-radius: 4px;
+    overflow-x: auto; margin: .8em 0; font-size: .82em; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-all;
+  }}
+  pre code {{ background: none; padding: 0; }}
+  pre:has(> code.language-mermaid) {{ background: #fff; text-align: center; }}
+  hr {{ border: none; border-top: 1px solid #ccc; margin: 1.5em 0; }}
+  table {{ width: 100%; border-collapse: collapse; margin: .8em 0; font-size: .85em; }}
+  th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
+  th {{ background: #eee; font-weight: 600; }}
+  a {{ color: #fb7299; text-decoration: none; }}
+  .katex {{ font-size: 1.04em !important; }}
+  .katex-display {{ margin: .8em 0; overflow-x: auto; }}
+  .katex-display > .katex {{ font-size: 1.06em !important; }}
+</style>
+</head>
+<body>
+<div id="content">
+{html_body}
+</div>
+</body>
+</html>"""
+
+
+def _write_article_pdf_playwright(article: str, path: Path, md_lib) -> None:
+    """PDF via Playwright headless Chromium — full LaTeX math support.
+
+    After the page + KaTeX scripts finish loading, we programmatically
+    call renderMathInElement via page.evaluate(), wait for the KaTeX fonts
+    to load, then print to PDF.
+
+    Uses Playwright's bundled Chromium (not system Chrome) because system
+    Chrome on macOS has a known bug where Chinese text is rendered as
+    invisible white-on-white vector paths in PDF output.
+    """
+    html = _build_pdf_html(article, md_lib)
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", suffix=".html", delete=False
+    ) as tmp:
+        tmp.write(html)
+        html_path = Path(tmp.name)
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            # Always use Playwright's bundled Chromium — system Chrome
+            # (channel="chrome") produces PDFs with invisible Chinese text
+            # on macOS (text rendered as white vector paths).
+            browser = pw.chromium.launch(headless=True)
+
+            page = browser.new_page()
+            page.goto(html_path.as_uri(), wait_until="networkidle", timeout=30000)
+
+            # Programmatically render KaTeX math now that external scripts are
+            # loaded, then wait for the KaTeX web fonts to finish loading.
+            # KaTeX fonts are only requested after renderMathInElement mutates
+            # the DOM; printing before they arrive leaves math glyphs blank
+            # (invisible) in the PDF.
+            page.evaluate("""async () => {
+                if (typeof renderMathInElement !== 'undefined') {
+                    renderMathInElement(document.getElementById('content'), {
+                        delimiters: [
+                            {left: '$$', right: '$$', display: true},
+                            {left: '\\\\[', right: '\\\\]', display: true},
+                            {left: '$', right: '$', display: false},
+                            {left: '\\\\(', right: '\\\\)', display: false},
+                        ],
+                        ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+                    });
+                }
+                if (typeof mermaid !== 'undefined') {
+                    try {
+                        mermaid.initialize({startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true});
+                        await mermaid.run({querySelector: 'pre code.language-mermaid'});
+                    } catch (e) {}
+                }
+                document.body.offsetHeight;  // force reflow to trigger font requests
+                await document.fonts.ready;
+            }""")
+
+            page.pdf(
+                path=str(path),
+                format="A4",
+                margin={"top": "20mm", "right": "18mm", "bottom": "20mm", "left": "18mm"},
+            )
+            browser.close()
+    finally:
+        try:
+            html_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _write_article_pdf_reportlab(article: str, path: Path) -> None:
+    """PDF via reportlab — fallback when Playwright is unavailable.
+
+    LaTeX math will NOT be rendered (reportlab has no CSS/JS engine).
+    The raw $...$ / $$...$$ markup will appear as plain text in the output.
+    """
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -1244,6 +2669,12 @@ def register_pdf_font() -> str:
     from reportlab.pdfbase.ttfonts import TTFont
 
     font_candidates = [
+        # macOS fonts
+        Path("/System/Library/Fonts/PingFang.ttc"),
+        Path("/System/Library/Fonts/STHeiti Light.ttc"),
+        Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        # Windows fonts
         Path("C:/Windows/Fonts/Deng.ttf"),
         Path("C:/Windows/Fonts/NotoSansSC-VF.ttf"),
         Path("C:/Windows/Fonts/simsun.ttc"),
@@ -1259,17 +2690,20 @@ def register_pdf_font() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bilibili 视频转写和文章整理工具")
+    parser = argparse.ArgumentParser(description="Bilibili / YouTube 视频转写和文章整理工具")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
     args = parser.parse_args()
 
+    _db.init_db()
     STATIC_DIR.mkdir(exist_ok=True)
-    worker = threading.Thread(target=job_worker, daemon=True)
-    worker.start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Listening on http://{args.host}:{args.port}")
-    server.serve_forever()
+    print("提示：请在新终端运行 python worker.py 启动后台任务处理")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,98 @@
+param(
+    [int]$Port = 8000,
+    [string]$HostAddr = "127.0.0.1",
+    [string]$PythonPath = ""
+)
+
+$ErrorActionPreference = "Continue"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$pidDir = Join-Path $scriptDir ".pids"
+$serverLog = Join-Path $scriptDir "server.log"
+$workerLog = Join-Path $scriptDir "worker.log"
+
+Write-Host "=== 视频转文章 — 启动 ===" -ForegroundColor Cyan
+
+# 1. Stop existing processes
+Write-Host "[1/3] 停止已有进程..." -ForegroundColor Gray
+& "$scriptDir\stop.ps1" -Port $Port 2>$null
+Start-Sleep -Seconds 1
+
+# 2. Detect Python
+if (-not $PythonPath) {
+    $PythonPath = (Get-Command python -ErrorAction SilentlyContinue).Source
+}
+if (-not $PythonPath) {
+    $PythonPath = (Get-Command python3 -ErrorAction SilentlyContinue).Source
+}
+if (-not $PythonPath) {
+    # Fallback to the known codex runtime path
+    $PythonPath = "C:\Users\yun77\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+}
+if (-not (Test-Path $PythonPath)) {
+    Write-Host "ERROR: Python not found. Set -PythonPath or ensure python is in PATH." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Python: $PythonPath" -ForegroundColor Gray
+
+# 3. Create PID directory
+New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
+
+# 4. Start server
+Write-Host "[2/3] 启动 HTTP 服务（端口 $Port）..." -ForegroundColor Gray
+$serverProcess = Start-Process -FilePath $PythonPath `
+    -ArgumentList "server.py", "--host", $HostAddr, "--port", $Port `
+    -NoNewWindow -PassThru `
+    -RedirectStandardOutput $serverLog `
+    -RedirectStandardError $serverLog
+
+$serverProcess.Id | Out-File -FilePath (Join-Path $pidDir "server.pid") -NoNewline
+
+# Wait for server to be ready
+$ready = $false
+for ($i = 0; $i -lt 10; $i++) {
+    try {
+        $response = Invoke-WebRequest -Uri "http://${HostAddr}:${Port}/api/config" -TimeoutSec 2 -ErrorAction SilentlyContinue
+        if ($response.StatusCode -eq 200) {
+            $ready = $true
+            break
+        }
+    } catch { }
+    if ($serverProcess.HasExited) {
+        Write-Host "ERROR: Server failed to start (check $serverLog)" -ForegroundColor Red
+        exit 1
+    }
+    Start-Sleep -Seconds 1
+}
+
+if (-not $ready -and $serverProcess.HasExited) {
+    Write-Host "ERROR: Server process died (check $serverLog)" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "  √ HTTP 服务已启动 (PID: $($serverProcess.Id))" -ForegroundColor Green
+
+# 5. Start worker
+Write-Host "[3/3] 启动后台 Worker..." -ForegroundColor Gray
+$workerProcess = Start-Process -FilePath $PythonPath `
+    -ArgumentList "worker.py" `
+    -NoNewWindow -PassThru `
+    -RedirectStandardOutput $workerLog `
+    -RedirectStandardError $workerLog
+
+$workerProcess.Id | Out-File -FilePath (Join-Path $pidDir "worker.pid") -NoNewline
+
+Start-Sleep -Seconds 1
+if (-not $workerProcess.HasExited) {
+    Write-Host "  √ Worker 已启动 (PID: $($workerProcess.Id))" -ForegroundColor Green
+} else {
+    Write-Host "  ! Worker 进程已退出，查看日志: $workerLog" -ForegroundColor Yellow
+}
+
+Write-Host ""
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+Write-Host "  Web UI:  http://${HostAddr}:${Port}" -ForegroundColor White
+Write-Host "  Server log: $serverLog" -ForegroundColor Gray
+Write-Host "  Worker log: $workerLog" -ForegroundColor Gray
+Write-Host "  停止服务:   .\stop.ps1" -ForegroundColor Gray
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan

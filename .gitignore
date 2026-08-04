@@ -3,7 +3,17 @@ __pycache__/
 .venv/
 outputs/
 models/
+vendor/
 docs/
 .env.local
 config.json
+.browser-data/
 server.log
+youtube-cookies.txt
+.gdrive-token.json
+jobs.db
+jobs.db-wal
+jobs.db-shm
+.pids/
+worker.log
+.DS_Store
