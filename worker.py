@@ -88,6 +88,7 @@ def _build_job(data: dict) -> Job:
         url=data["url"],
         title=data.get("title", ""),
         cookie_string=data.get("cookie_string", ""),
+        user_id=data.get("user_id", ""),
         status=data["status"],
         stage=data["stage"],
         logs=data.get("logs", []) or [],

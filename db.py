@@ -35,6 +35,7 @@ def _connect() -> sqlite3.Connection:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id              TEXT PRIMARY KEY,
+    user_id         TEXT    DEFAULT '',
     url             TEXT    NOT NULL,
     title           TEXT    DEFAULT '',
     cookie_string   TEXT    DEFAULT '',
@@ -54,6 +55,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
+
+CREATE TABLE IF NOT EXISTS users (
+    id              TEXT PRIMARY KEY,
+    username        TEXT    NOT NULL UNIQUE,
+    password_hash   TEXT    NOT NULL,
+    is_admin        INTEGER DEFAULT 0,
+    is_active       INTEGER DEFAULT 1,
+    settings        TEXT    DEFAULT '{}',
+    failed_attempts INTEGER DEFAULT 0,
+    locked_until    REAL    DEFAULT 0,
+    created_at      REAL,
+    last_login_at   REAL
+);
 """
 
 
@@ -62,12 +76,18 @@ def init_db() -> None:
     conn = _connect()
     try:
         conn.executescript(_SCHEMA)
-        # Migration: add title column for existing databases
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN title TEXT DEFAULT ''")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Migrations for existing databases
+        for stmt in (
+            "ALTER TABLE jobs ADD COLUMN title TEXT DEFAULT ''",
+            "ALTER TABLE jobs ADD COLUMN user_id TEXT DEFAULT ''",
+        ):
+            try:
+                conn.execute(stmt)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        # Index on user_id (must run after the column migration above)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
     finally:
         conn.close()
 
@@ -97,18 +117,19 @@ def create_job(
     url: str,
     title: str = "",
     cookie_string: str = "",
+    user_id: str = "",
 ) -> dict[str, Any]:
     """Insert a new job and return it as a dict."""
     now = time.time()
     conn = _connect()
     try:
         conn.execute(
-            """INSERT INTO jobs (id, url, title, cookie_string, status, stage, logs, progress,
+            """INSERT INTO jobs (id, user_id, url, title, cookie_string, status, stage, logs, progress,
                transcript, article, error, output_dir, page_output_dirs, page_articles,
                created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'queued', '排队等待', '["已加入任务队列"]', 0,
+               VALUES (?, ?, ?, ?, ?, 'queued', '排队等待', '["已加入任务队列"]', 0,
                        '', '', '', '', '[]', '[]', ?, ?)""",
-            (job_id, url, title, cookie_string, now, now),
+            (job_id, user_id, url, title, cookie_string, now, now),
         )
         conn.commit()
         return _row_to_dict(
@@ -317,6 +338,232 @@ def list_all_jobs(limit: int = 50) -> list[dict[str, Any]]:
         return [_row_to_dict(r) for r in active] + [_row_to_dict(r) for r in recent]
     finally:
         conn.close()
+
+
+def list_user_jobs(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    """Return a user's jobs: active jobs always first, then recent ones, newest first."""
+    conn = _connect()
+    try:
+        active = conn.execute(
+            """SELECT * FROM jobs
+               WHERE user_id = ? AND status IN ('running', 'queued')
+               ORDER BY created_at""",
+            (user_id,),
+        ).fetchall()
+        recent = conn.execute(
+            """SELECT * FROM jobs
+               WHERE user_id = ? AND status NOT IN ('running', 'queued')
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
+        return [_row_to_dict(r) for r in active] + [_row_to_dict(r) for r in recent]
+    finally:
+        conn.close()
+
+
+def list_user_jobs_page(user_id: str, page: int = 1, per_page: int = 20) -> dict:
+    """Return one page of a user's jobs (active jobs first, then newest) plus pagination info."""
+    total = count_user_jobs(user_id)
+    if per_page <= 0:
+        per_page = 20
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(max(1, page), pages)
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM jobs
+               WHERE user_id = ? AND id != '__worker_heartbeat__'
+               ORDER BY CASE WHEN status IN ('running', 'queued') THEN 0 ELSE 1 END,
+                        created_at DESC
+               LIMIT ? OFFSET ?""",
+            (user_id, per_page, (page - 1) * per_page),
+        ).fetchall()
+        active = conn.execute(
+            """SELECT COUNT(*) FROM jobs
+               WHERE user_id = ? AND id != '__worker_heartbeat__'
+                 AND status IN ('running', 'queued')""",
+            (user_id,),
+        ).fetchone()[0]
+        return {
+            "jobs": [_row_to_dict(r) for r in rows],
+            "total": total,
+            "active": active,
+            "page": page,
+            "per_page": per_page,
+            "pages": pages,
+        }
+    finally:
+        conn.close()
+
+
+def count_user_jobs(user_id: str) -> int:
+    """Total number of a user's jobs (excluding heartbeat)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND id != '__worker_heartbeat__'",
+            (user_id,),
+        ).fetchone()
+        return row[0]
+    finally:
+        conn.close()
+
+
+def get_user_job(user_id: str, job_id: str) -> dict[str, Any] | None:
+    """Return a job only if it belongs to the given user (ownership check)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE id = ? AND user_id = ?",
+            (job_id, user_id),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_user_job_snapshot(user_id: str, job_id: str) -> dict[str, Any] | None:
+    """Ownership-checked snapshot for the server polling endpoint."""
+    job = get_user_job(user_id, job_id)
+    if job is None:
+        return None
+    elapsed = 0
+    if job["status"] in ("running", "queued"):
+        elapsed = int(time.time() - job["created_at"])
+    job["elapsed"] = elapsed
+    return job
+
+
+# ---------------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------------
+
+def _user_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    try:
+        d["settings"] = json.loads(d["settings"]) if d["settings"] else {}
+    except (json.JSONDecodeError, KeyError):
+        d["settings"] = {}
+    d["is_admin"] = bool(d["is_admin"])
+    d["is_active"] = bool(d["is_active"])
+    return d
+
+
+def create_user(
+    *,
+    user_id: str,
+    username: str,
+    password_hash: str,
+) -> dict[str, Any] | None:
+    """Insert a new user.  Returns the user dict, or None if the username is taken."""
+    now = time.time()
+    conn = _connect()
+    try:
+        try:
+            conn.execute(
+                """INSERT INTO users (id, username, password_hash, is_admin, is_active,
+                   settings, created_at)
+                   VALUES (?, ?, ?, 0, 1, '{}', ?)""",
+                (user_id, username, password_hash, now),
+            )
+        except sqlite3.IntegrityError:
+            return None
+        # Claim any legacy jobs (created before user accounts) for this user
+        conn.execute(
+            "UPDATE jobs SET user_id = ? WHERE user_id = '' AND id != '__worker_heartbeat__'",
+            (user_id,),
+        )
+        conn.commit()
+        return get_user(user_id)
+    finally:
+        conn.close()
+
+
+def get_user(user_id: str) -> dict[str, Any] | None:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return _user_row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return _user_row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_users() -> list[dict[str, Any]]:
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM users ORDER BY created_at").fetchall()
+        return [_user_row_to_dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_users() -> int:
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+        return int(row["n"])
+    finally:
+        conn.close()
+
+
+def update_user(
+    user_id: str,
+    *,
+    password_hash: str | None = None,
+    is_admin: bool | None = None,
+    is_active: bool | None = None,
+    settings: dict[str, Any] | None = None,
+    last_login_at: float | None = None,
+    failed_attempts: int | None = None,
+    locked_until: float | None = None,
+) -> None:
+    """Update one or more fields of a user."""
+    conn = _connect()
+    try:
+        sets: list[str] = []
+        params: list[Any] = []
+        for col, val in (
+            ("password_hash", password_hash),
+            ("is_admin", int(is_admin) if is_admin is not None else None),
+            ("is_active", int(is_active) if is_active is not None else None),
+            ("settings", json.dumps(settings, ensure_ascii=False) if settings is not None else None),
+            ("last_login_at", last_login_at),
+            ("failed_attempts", failed_attempts),
+            ("locked_until", locked_until),
+        ):
+            if val is not None:
+                sets.append(f"{col} = ?")
+                params.append(val)
+        if not sets:
+            return
+        params.append(user_id)
+        conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_user_login_attempt(user_id: str, failed_attempts: int, locked_until: float) -> None:
+    """Record a failed login attempt / lockout."""
+    update_user(
+        user_id,
+        failed_attempts=failed_attempts,
+        locked_until=locked_until,
+    )
+
+
+def reset_login_attempts(user_id: str) -> None:
+    update_user(user_id, failed_attempts=0, locked_until=0)
 
 
 def cancel_job(job_id: str) -> bool:

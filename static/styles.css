@@ -248,41 +248,8 @@ button.ghost:hover {
 
 /* ── 状态行 ─────────────────────────────────── */
 
-.status-row {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.progress-wrap {
-  height: 8px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #e3ded6;
-}
-
-.progress-bar {
-  width: 0;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-  transition: width 240ms ease;
-}
-
-.status-info {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.status-info .elapsed {
-  font-variant-numeric: tabular-nums;
-  margin-left: auto;
-}
-
 #stageText {
+  margin: 10px 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -467,6 +434,50 @@ button.ghost:hover {
   overflow-y: auto;
 }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.page-btn {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+
+.page-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: #faf9f7;
+}
+
+.page-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.page-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.page-ellipsis {
+  color: var(--muted);
+  padding: 0 2px;
+}
+
 .job-item {
   display: flex;
   flex-wrap: wrap;
@@ -490,6 +501,10 @@ button.ghost:hover {
 .job-item.expanded {
   background: #faf9f7;
   cursor: default;
+}
+
+.job-detail-area {
+  width: 100%;
 }
 
 .job-item-main {
@@ -519,6 +534,7 @@ button.ghost:hover {
 .badge-done    { background: #d1fae5; color: #065f46; }
 .badge-error   { background: #fee2e2; color: #991b1b; }
 .badge-cancelled { background: #f3f4f6; color: #6b7280; }
+.badge-multi   { background: #ede9fe; color: #6d28d9; }
 
 .job-item-url {
   overflow: hidden;
@@ -659,6 +675,29 @@ button.ghost:hover {
   background: #fffbeb;
 }
 
+.job-read-btn {
+  width: 28px;
+  height: 28px;
+  min-height: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: #fff;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color .15s, color .15s, background .15s;
+}
+
+.job-read-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  background: #f0faf9;
+}
+
 .job-empty {
   padding: 24px 14px;
   text-align: center;
@@ -728,6 +767,31 @@ button.ghost:hover {
   font-size: 12px;
 }
 
+/* 合集任务分篇选择器 */
+.job-page-picker {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.job-page-select {
+  min-height: 30px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.job-page-count {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .job-detail-article {
   width: 100%;
   min-height: 100px;
@@ -742,6 +806,282 @@ button.ghost:hover {
   background: #fff;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* markdown 渲染后的 HTML 预览样式 */
+.job-detail-html {
+  width: 100%;
+  max-height: 500px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 14px 18px;
+  font-size: 14px;
+  line-height: 1.8;
+  color: var(--text);
+  background: #fff;
+  word-break: break-word;
+}
+
+.job-detail-html h1,
+.job-detail-html h2,
+.job-detail-html h3,
+.job-detail-html h4 {
+  margin: 1.1em 0 0.5em;
+  line-height: 1.35;
+}
+
+.job-detail-html h1:first-child,
+.job-detail-html h2:first-child,
+.job-detail-html h3:first-child {
+  margin-top: 0;
+}
+
+.job-detail-html p {
+  margin: 0.6em 0;
+}
+
+.job-detail-html ul,
+.job-detail-html ol {
+  margin: 0.6em 0;
+  padding-left: 1.6em;
+}
+
+.job-detail-html li {
+  margin: 0.25em 0;
+}
+
+.job-detail-html code {
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  background: #f4f2ef;
+  font-family: "SF Mono", "Menlo", "Cascadia Mono", Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.job-detail-html pre {
+  margin: 0.8em 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #faf9f7;
+  overflow-x: auto;
+}
+
+.job-detail-html pre code {
+  padding: 0;
+  background: none;
+}
+
+.job-detail-html blockquote {
+  margin: 0.8em 0;
+  padding: 0.2em 1em;
+  border-left: 3px solid var(--accent);
+  background: #fafaf8;
+  color: var(--muted);
+}
+
+.job-detail-html table {
+  width: 100%;
+  margin: 0.8em 0;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.job-detail-html th,
+.job-detail-html td {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+}
+
+.job-detail-html th {
+  background: #f7f6f4;
+  font-weight: 600;
+}
+
+.job-detail-html img {
+  max-width: 100%;
+}
+
+.job-detail-html a {
+  color: var(--accent);
+}
+
+.job-detail-html hr {
+  margin: 1.2em 0;
+  border: none;
+  border-top: 1px solid var(--line);
+}
+
+/* ── 阅读模式弹窗 ─────────────────────────────────── */
+
+/* 打开弹窗时锁定页面滚动 */
+body.reader-open {
+  overflow: hidden;
+}
+
+.reader-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4vh 16px 16px;
+  background: rgba(24, 26, 27, .55);
+  overflow-y: auto;
+}
+
+.reader-modal-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(880px, 100%);
+  max-height: 92vh;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.reader-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+  flex-shrink: 0;
+}
+
+.reader-modal-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.reader-modal-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.reader-modal-tools .ghost {
+  min-height: 28px;
+  font-size: 12px;
+}
+
+.reader-modal-close {
+  width: 30px;
+  height: 30px;
+  min-height: auto;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s, color .15s;
+}
+
+.reader-modal-close:hover {
+  background: #f0eeea;
+  color: var(--text);
+}
+
+.reader-modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 28px 20px 48px;
+  background: #fff;
+}
+
+/* 阅读排版：内容列居中、字号行距更舒适；
+   复用 .job-detail-html 的 markdown 排版规则，这里覆盖容器限制 */
+.reader-modal-body .reader-prose {
+  max-width: 720px;
+  margin: 0 auto;
+  max-height: none;
+  overflow: visible;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1.85;
+  background: transparent;
+}
+
+/* ── Mermaid 图表 ─────────────────────────────────── */
+
+/* 渲染前：代码块临时样式（居中白底，避免闪成代码块样式）；渲染失败时保留原文 */
+pre:has(> code.language-mermaid) {
+  background: #fff;
+  text-align: center;
+}
+
+/* 渲染后的图表容器 */
+.mermaid-block {
+  margin: 1em 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  text-align: center;
+  overflow-x: auto;
+}
+
+.mermaid-block svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* KaTeX 公式：独立行公式超宽时可横向滚动，避免撑破版面 */
+.job-detail-html .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
+@media (max-width: 640px) {
+  .reader-modal {
+    padding: 0;
+    align-items: stretch;
+  }
+
+  .reader-modal-panel {
+    width: 100%;
+    max-height: 100vh;
+    border-radius: 0;
+  }
+
+  .reader-modal-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .reader-modal-tools {
+    flex-wrap: wrap;
+  }
+
+  .reader-modal-head button,
+  .reader-modal-tools .job-page-select {
+    width: auto;
+  }
+
+  .reader-modal-body {
+    padding: 20px 16px 40px;
+  }
 }
 
 .job-detail-transcript,
@@ -798,4 +1138,236 @@ button.ghost:hover {
   button {
     width: 100%;
   }
+}
+
+/* ── 顶部导航栏 ─────────────────────────────────── */
+
+.main-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 24px;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.nav-links {
+  display: flex;
+  gap: 8px;
+}
+
+.nav-link {
+  display: inline-block;
+  padding: 7px 16px;
+  border-radius: 999px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 14px;
+  transition: background .2s, color .2s;
+}
+
+.nav-link:hover {
+  background: #f0eeea;
+  color: var(--text);
+}
+
+.nav-link.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.nav-user {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.nav-username {
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.main-nav .ghost {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.main-nav .ghost:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* ── 登录 / 注册页 ─────────────────────────────────── */
+
+.auth-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.auth-card {
+  width: min(400px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  padding: 36px 32px;
+  text-align: center;
+}
+
+.auth-card h1 {
+  font-size: 26px;
+  margin-bottom: 6px;
+}
+
+.auth-sub {
+  color: var(--muted);
+  font-size: 14px;
+  margin-bottom: 28px;
+}
+
+.auth-form {
+  display: grid;
+  gap: 16px;
+  text-align: left;
+}
+
+.auth-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.auth-form input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 15px;
+  background: #fff;
+  color: var(--text);
+}
+
+.auth-form input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(13, 127, 118, .12);
+}
+
+.auth-form button {
+  margin-top: 6px;
+  padding: 11px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-form button:hover {
+  background: var(--accent-strong);
+}
+
+.auth-form button:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.auth-error {
+  font-size: 13px;
+  color: var(--danger);
+  background: #fff5f5;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 0;
+}
+
+.auth-switch {
+  margin-top: 20px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.auth-switch a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.auth-switch a:hover {
+  text-decoration: underline;
+}
+
+/* ── 设置页 ─────────────────────────────────── */
+
+.hint {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.6;
+  margin-top: 10px;
+}
+
+.server-info p {
+  font-size: 14px;
+  color: var(--text);
+  line-height: 1.8;
+}
+
+.user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.user-row:last-child {
+  border-bottom: none;
+}
+
+.user-info {
+  display: grid;
+  gap: 2px;
+}
+
+.user-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.user-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.user-row .ghost {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.user-row .ghost:hover {
+  border-color: var(--danger);
+  color: var(--danger);
 }

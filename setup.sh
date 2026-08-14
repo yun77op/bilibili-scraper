@@ -127,4 +127,37 @@ else
 fi
 
 echo ""
+echo "Downloading Vue 3 (for web UI)..."
+VUE_VERSION="${VUE_VERSION:-3.5.13}"
+VUE_DIR="$SCRIPT_DIR/static/vendor/vue"
+VUE_FILE="$VUE_DIR/vue.esm-browser.prod.js"
+
+if [ -f "$VUE_FILE" ]; then
+    echo "Vue assets already exist: $VUE_DIR"
+else
+    mkdir -p "$VUE_DIR"
+    DOWNLOADED=""
+    for url in \
+        "https://registry.npmmirror.com/vue/-/vue-${VUE_VERSION}.tgz" \
+        "https://registry.npmjs.org/vue/-/vue-${VUE_VERSION}.tgz"; do
+        echo "Trying $url"
+        TMP_VUE="$(mktemp -d)"
+        if curl -fsSL --connect-timeout 8 --max-time 180 "$url" -o "$TMP_VUE/vue.tgz" \
+            && tar -xzf "$TMP_VUE/vue.tgz" -C "$TMP_VUE" \
+            && cp "$TMP_VUE/package/dist/vue.esm-browser.prod.js" "$VUE_FILE"; then
+            DOWNLOADED="yes"
+            rm -rf "$TMP_VUE"
+            break
+        fi
+        rm -rf "$TMP_VUE"
+    done
+    if [ -z "$DOWNLOADED" ]; then
+        echo "ERROR: failed to download Vue ${VUE_VERSION} from all mirrors; web UI will not work."
+        exit 1
+    else
+        echo "Vue ${VUE_VERSION} installed to $VUE_DIR"
+    fi
+fi
+
+echo ""
 echo "Done."

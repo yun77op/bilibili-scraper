@@ -3,7 +3,7 @@ set -eu
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${1:-8000}"
+PORT="${1:-8085}"
 PID_DIR="$SCRIPT_DIR/.pids"
 
 stop_by_pid_file() {

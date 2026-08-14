@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>注册 - 视频转文章</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="auth-body">
+    <div id="app">
+      <main class="auth-card">
+        <h1>创建账号</h1>
+        <p class="auth-sub">注册后可提交 Bilibili / YouTube 视频转文章任务</p>
+        <form class="auth-form" @submit.prevent="submit">
+          <label>
+            <span>用户名</span>
+            <input type="text" v-model="username" autocomplete="username" required autofocus maxlength="32" />
+          </label>
+          <label>
+            <span>密码（至少 6 位）</span>
+            <input type="password" v-model="password" autocomplete="new-password" required />
+          </label>
+          <label>
+            <span>确认密码</span>
+            <input type="password" v-model="password2" autocomplete="new-password" required />
+          </label>
+          <p class="auth-error" v-if="error">{{ error }}</p>
+          <button type="submit" :disabled="busy">{{ busy ? "注册中…" : "注 册" }}</button>
+        </form>
+        <p class="auth-switch">已有账号？<a href="/login">直接登录</a></p>
+      </main>
+    </div>
+    <script type="module" src="/static/register.js"></script>
+  </body>
+</html>

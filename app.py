@@ -20,8 +20,6 @@ import wave
 
 import requests
 from dataclasses import dataclass, field
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +42,6 @@ WHISPER_MODEL_DIR = MODEL_DIR / "whisper"
 LOCAL_WHISPER_DIR = MODEL_DIR / "faster-whisper"
 ENV_FILE = ROOT / ".env.local"
 CONFIG_FILE = ROOT / "config.json"
-ACCESS_LOG = ROOT / "server.log"
 BILIBILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
 BILIBILI_PLAYURL_APIS = [
     "https://api.bilibili.com/x/player/wbi/playurl",
@@ -105,6 +102,7 @@ class Job:
     url: str
     title: str = ""
     cookie_string: str = ""
+    user_id: str = ""
     status: str = "queued"
     stage: str = "等待开始"
     logs: list[str] = field(default_factory=list)
@@ -176,6 +174,19 @@ _cancel_lock = threading.Lock()
 def sanitize_filename(value: str) -> str:
     value = re.sub(r"[^\w.\u4e00-\u9fff-]+", "-", value).strip("-")
     return value[:100] or "video"
+
+
+# 目录内最长文件名：sanitize 上限 100 + "-" + yt_id(11) + 扩展名(4) = 116
+_MAX_INNER_FILENAME_LEN = 116
+
+
+def _output_dir_name(stem: str, suffix: str) -> str:
+    """按 Windows MAX_PATH(260) 预算生成输出目录名，避免路径超长导致文件创建失败。
+
+    suffix 不含前导 "-"，例如 "20260806-BV1aQMX6oEni-p6"。
+    """
+    budget = 259 - len(str(OUTPUT_DIR)) - 3 - _MAX_INNER_FILENAME_LEN - len(suffix)
+    return f"{stem[:max(0, budget)]}-{suffix}"
 
 
 def require_tool(name: str) -> str:
@@ -1211,7 +1222,6 @@ def _process_bilibili(job: Job) -> None:
         job.log("任务完成", 100)
         job.log(job.build_summary())
         if job.output_dir:
-            _auto_save_page(job, Path(job.output_dir))
             _auto_gdrive_upload(job, Path(job.output_dir))
     else:
         # Multiple pages — ?p=N means "start from episode N to the end"
@@ -1247,9 +1257,8 @@ def _process_bilibili(job: Job) -> None:
             all_articles.append(job.article)
             all_output_dirs.append(Path(job.output_dir))
 
-            # 处理完一集就立即上传、保存，不等全部完成
+            # 处理完一集就立即上传，不等全部完成
             _auto_gdrive_upload(job, Path(job.output_dir))
-            _auto_save_page(job, Path(job.output_dir))
 
         root_dir = Path(job.output_dir).parent if job.output_dir else OUTPUT_DIR
         if all_transcripts:
@@ -1293,9 +1302,10 @@ def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
     collection_stem = sanitize_filename(collection) if collection else ""
     if collection_stem and collection_stem != stem:
         stem = f"{collection_stem}-{stem}"
-    dir_name = f"{stem[:180]}-{time.strftime('%Y%m%d')}-{bvid}-p{page_index + 1}"
     OUTPUT_DIR.mkdir(exist_ok=True)
-    out_dir = OUTPUT_DIR / dir_name
+    out_dir = OUTPUT_DIR / _output_dir_name(
+        stem, f"{time.strftime('%Y%m%d')}-{bvid}-p{page_index + 1}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     job.output_dir = str(out_dir)
 
@@ -1402,84 +1412,39 @@ def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
     return audio_path
 
 
-def _local_save_format(cfg: dict) -> str:
-    """读取本地保存格式配置：pdf / html / both，默认 pdf（兼容旧配置）。"""
-    fmt = str(cfg.get("save_format", "pdf")).strip().lower()
-    return fmt if fmt in ("pdf", "html", "both") else "pdf"
-
-
-def _write_article_by_format(article: str, stem_path: Path, fmt: str) -> list[Path]:
-    """按保存格式生成 PDF / HTML 文件，返回生成的文件路径列表。"""
-    written: list[Path] = []
-    if fmt in ("pdf", "both"):
-        pdf_path = stem_path.with_suffix(".pdf")
-        write_article_pdf(article, pdf_path)
-        written.append(pdf_path)
-    if fmt in ("html", "both"):
-        html_path = stem_path.with_suffix(".html")
-        write_article_html(article, html_path)
-        written.append(html_path)
-    return written
-
-
-def _auto_save_page(job: Job, out_dir: Path) -> None:
-    """Save a single page's article as MD + PDF/HTML locally if auto_save is enabled."""
-    cfg = load_config()
-    if not cfg.get("auto_save"):
-        return
-
-    article = job.article
-    if not article.strip():
-        return
-
-    DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    stem = out_dir.name
-
-    try:
-        md_path = DOCS_DIR / f"{stem}.md"
-        md_path.write_text(article, encoding="utf-8")
-        written = _write_article_by_format(article, DOCS_DIR / stem, _local_save_format(cfg))
-        job.log(f"已保存本地：{', '.join(str(p) for p in written)}")
-
-        pdf_dir_resolved = str(cfg.get("pdf_dir", "")).strip()
-        if pdf_dir_resolved:
-            extra_dir = Path(pdf_dir_resolved)
-            if cfg.get("date_subdir"):
-                extra_dir = extra_dir / time.strftime("%Y%m%d")
-            extra_dir.mkdir(parents=True, exist_ok=True)
-            for p in written:
-                shutil.copy2(p, extra_dir / p.name)
-    except Exception as exc:
-        job.log(f"⚠️ 本地保存失败：{exc}")
-
-
 def _auto_gdrive_upload(job: Job, out_dir: Path) -> None:
-    """Upload article (HTML or PDF) to Google Drive if configured."""
-    cfg = load_config()
-    if not cfg.get("gdrive_enabled"):
+    """Upload article (HTML or PDF) to the job owner's Google Drive if configured.
+
+    Upload preferences (enabled / folder / format / date subdir) come from the
+    user's own settings; credentials are per-user tokens.
+    """
+    settings = _user_settings(job.user_id)
+    if not settings.get("gdrive_enabled"):
         return
     try:
-        gdrive_format = str(cfg.get("gdrive_format", "html")).strip().lower()
-        gdrive_folder = str(cfg.get("gdrive_folder_id", "")).strip()
-        use_date_subdir = bool(cfg.get("date_subdir"))
+        gdrive_format = str(settings.get("gdrive_format", "html")).strip().lower()
+        gdrive_folder = str(settings.get("gdrive_folder_id", "")).strip()
+        use_date_subdir = bool(settings.get("date_subdir"))
         stem = out_dir.name
 
         if gdrive_format == "html":
             html_path = out_dir / f"{stem}.html"
             if not html_path.exists():
                 write_article_html(job.article, html_path)
-            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir)
+            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, job.user_id)
             if err:
                 return job.log(f"⚠️ Drive 上传失败：{err.get('message', '')}")
-            result = gdrive_upload_file(str(html_path), parent_folder_id=target_folder, mime_type="text/html")
+            result = gdrive_upload_file(str(html_path), parent_folder_id=target_folder,
+                                        mime_type="text/html", user_id=job.user_id)
         else:
             pdf_path = out_dir / f"{stem}.pdf"
             if not pdf_path.exists():
                 write_article_pdf(job.article, pdf_path)
-            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir)
+            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, job.user_id)
             if err:
                 return job.log(f"⚠️ Drive 上传失败：{err.get('message', '')}")
-            result = gdrive_upload_file(str(pdf_path), parent_folder_id=target_folder, mime_type="application/pdf")
+            result = gdrive_upload_file(str(pdf_path), parent_folder_id=target_folder,
+                                        mime_type="application/pdf", user_id=job.user_id)
 
         if result.get("status") == "success":
             d = result["data"]
@@ -1490,15 +1455,26 @@ def _auto_gdrive_upload(job: Job, out_dir: Path) -> None:
         job.log(f"⚠️ Drive 上传异常：{exc}")
 
 
-def _resolve_gdrive_folder(folder_id: str, date_subdir: bool) -> tuple[str, dict | None]:
+def _user_settings(user_id: str) -> dict[str, Any]:
+    """Return the user's settings dict (Drive / YouTube preferences), or {}."""
+    if not user_id:
+        return {}
+    user = _db.get_user(user_id)
+    if not user:
+        return {}
+    return user.get("settings") or {}
+
+
+def _resolve_gdrive_folder(folder_id: str, date_subdir: bool,
+                           user_id: str = "") -> tuple[str, dict | None]:
     """Resolve target folder ID, with optional date sub-directory."""
     from gdrive_uploader import find_or_create_folder, _resolve_folder_id
-    target_folder, err = _resolve_folder_id(folder_id)
+    target_folder, err = _resolve_folder_id(folder_id, user_id or None)
     if err:
         return "", err
     if date_subdir:
         date_name = time.strftime("%Y%m%d")
-        found_id, err = find_or_create_folder(date_name, target_folder or "")
+        found_id, err = find_or_create_folder(date_name, target_folder or "", user_id=user_id or None)
         if err:
             return "", err
         target_folder = found_id or folder_id
@@ -1529,9 +1505,10 @@ def _process_youtube(job: Job) -> None:
     job._stage_end("获取视频信息")
     title = info.get("title") or yt_id
     job.title = title
-    dir_name = f"{sanitize_filename(title)}-{time.strftime('%Y%m%d')}-youtube-{yt_id}"
     OUTPUT_DIR.mkdir(exist_ok=True)
-    out_dir = OUTPUT_DIR / dir_name
+    out_dir = OUTPUT_DIR / _output_dir_name(
+        sanitize_filename(title), f"{time.strftime('%Y%m%d')}-youtube-{yt_id}"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     job.output_dir = str(out_dir)
 
@@ -1573,328 +1550,8 @@ def _process_youtube(job: Job) -> None:
     job.log("任务完成", 100)
     job.log(job.build_summary())
 
-    # Auto-save local docs and upload to Google Drive if enabled
-    _auto_save_page(job, out_dir)
+    # Upload to the owner's Google Drive if enabled
     _auto_gdrive_upload(job, out_dir)
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "VideoScraper/0.2"
-
-    def do_GET(self) -> None:
-        if self.path == "/" or self.path.startswith("/?"):
-            self.send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
-            return
-        if self.path == "/api/config":
-            cfg = load_config()
-            gdrive_authed = False
-            try:
-                gdrive_authed = gdrive_is_authenticated()
-            except Exception:
-                pass
-            # Worker 心跳检测：最近 10 秒内有心跳则认为在线
-            hb = _db.get_worker_heartbeat()
-            worker_alive = hb is not None and (time.time() - hb) < 10
-            self.send_json(
-                {
-                    "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
-                    "deepseek_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
-                    "whisper_device": os.getenv("WHISPER_DEVICE", "auto"),
-                    "pdf_dir": cfg.get("pdf_dir", ""),
-                    "auto_save": cfg.get("auto_save", False),
-                    "date_subdir": cfg.get("date_subdir", False),
-                    "save_format": _local_save_format(cfg),
-                    "youtube_cookie_configured": bool(str(cfg.get("youtube_cookie", "")).strip()),
-                    "gdrive_enabled": bool(cfg.get("gdrive_enabled")),
-                    "gdrive_folder_id": str(cfg.get("gdrive_folder_id", "")).strip(),
-                    "gdrive_format": str(cfg.get("gdrive_format", "html")).strip(),
-                    "gdrive_authenticated": gdrive_authed,
-                    "worker_alive": worker_alive,
-                }
-            )
-            return
-        if self.path == "/app.js":
-            self.send_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
-            return
-        if self.path == "/styles.css":
-            self.send_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
-            return
-        if self.path == "/api/jobs/" or self.path == "/api/jobs":
-            self.send_json(_db.list_all_jobs())
-            return
-        if self.path.startswith("/api/jobs/"):
-            job_id = self.path.rsplit("/", 1)[-1]
-            snap = _db.get_job_snapshot(job_id)
-            if snap is None:
-                self.send_json({"error": "任务不存在"}, status=HTTPStatus.NOT_FOUND)
-            else:
-                self.send_json(snap)
-            return
-        if self.path == "/api/gdrive/status":
-            try:
-                authed = gdrive_is_authenticated()
-            except Exception:
-                authed = False
-            self.send_json({"authenticated": authed})
-            return
-        if self.path.startswith("/api/gdrive/callback"):
-            parsed = urllib.parse.urlparse(self.path)
-            query = urllib.parse.parse_qs(parsed.query)
-            code = query.get("code", [""])[0]
-            state = query.get("state", [""])[0]
-            if not code:
-                self.send_html_page("授权失败", "未收到 Google 的授权码，请重试。")
-                return
-            success, message = gdrive_exchange_code(code, state)
-            self.send_html_page(
-                "授权成功" if success else "授权失败",
-                message,
-                auto_close=success,
-            )
-            return
-        self.send_error(HTTPStatus.NOT_FOUND)
-
-    def do_POST(self) -> None:
-        if self.path == "/api/config":
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 0:
-                try:
-                    body = json.loads(self.rfile.read(length).decode("utf-8"))
-                    cfg = load_config()
-                    cfg["pdf_dir"] = str(body.get("pdf_dir", "")).strip()
-                    cfg["auto_save"] = bool(body.get("auto_save"))
-                    cfg["date_subdir"] = bool(body.get("date_subdir"))
-                    if "save_format" in body:
-                        cfg["save_format"] = _local_save_format(
-                            {"save_format": body.get("save_format")}
-                        )
-                    if "youtube_cookie" in body:
-                        cfg["youtube_cookie"] = str(body.get("youtube_cookie", "")).strip()
-                    if "gdrive_enabled" in body:
-                        cfg["gdrive_enabled"] = bool(body.get("gdrive_enabled"))
-                    if "gdrive_folder_id" in body:
-                        cfg["gdrive_folder_id"] = str(body.get("gdrive_folder_id", "")).strip()
-                    if "gdrive_format" in body:
-                        cfg["gdrive_format"] = str(body.get("gdrive_format", "html")).strip()
-                    save_config(cfg)
-                    self.send_json({"ok": True})
-                    return
-                except json.JSONDecodeError:
-                    pass
-            self.send_json({"ok": False, "error": "无效请求"}, status=HTTPStatus.BAD_REQUEST)
-            return
-
-        if self.path == "/api/youtube-login" and self.command == "POST":
-            try:
-                from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-            except ImportError:
-                self.send_json(
-                    {"ok": False, "error": "请先安装 playwright：pip install playwright"},
-                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                return
-
-            user_data_dir = ROOT / ".browser-data"
-            user_data_dir.mkdir(parents=True, exist_ok=True)
-
-            try:
-                with sync_playwright() as pw:
-                    browser = pw.chromium.launch_persistent_context(
-                        str(user_data_dir),
-                        headless=False,
-                        channel="chrome",
-                        locale="zh-CN",
-                    )
-                    page = browser.pages[0] if browser.pages else browser.new_page()
-                    page.goto("https://www.youtube.com/", wait_until="domcontentloaded")
-
-                    # 等待登录：检测用户头像/账号按钮出现，最多等 5 分钟
-                    try:
-                        page.wait_for_selector(
-                            '#avatar-btn, ytd-account-button, button[aria-label*="Google"], '
-                            'ytd-active-account-header-renderer, #account-button',
-                            timeout=300_000,
-                        )
-                    except PlaywrightTimeout:
-                        browser.close()
-                        self.send_json(
-                            {"ok": False, "error": "登录超时（5 分钟），请重试"},
-                            status=HTTPStatus.REQUEST_TIMEOUT,
-                        )
-                        return
-
-                    cookies = browser.cookies()
-                    browser.close()
-            except Exception as exc:
-                self.send_json(
-                    {"ok": False, "error": f"启动浏览器失败: {exc}"},
-                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                return
-
-            cookie_str = "; ".join(
-                f"{c['name']}={c['value']}"
-                for c in cookies
-                if c.get("domain", "").endswith("youtube.com")
-            )
-            if not cookie_str:
-                self.send_json(
-                    {"ok": False, "error": "未获取到 YouTube cookie，请确认已登录"},
-                    status=HTTPStatus.BAD_REQUEST,
-                )
-                return
-
-            cfg = load_config()
-            cfg["youtube_cookie"] = cookie_str
-            save_config(cfg)
-            self.send_json({"ok": True})
-            return
-
-        if self.path.startswith("/api/jobs/") and self.path.endswith("/cancel"):
-            job_id = self.path.rsplit("/", 2)[-2]
-            ok = _db.cancel_job(job_id)
-            self.send_json({"ok": ok, "id": job_id})
-            return
-
-        if self.path.startswith("/api/jobs/") and self.path.endswith("/delete"):
-            job_id = self.path.rsplit("/", 2)[-2]
-            ok = _db.delete_job(job_id)
-            self.send_json({"ok": ok, "id": job_id})
-            return
-
-        if self.path.startswith("/api/jobs/") and self.path.endswith("/save-doc"):
-            job_id = self.path.split("/")[-2]
-            pdf_dir = None
-            date_subdir = False
-            length = int(self.headers.get("Content-Length", "0"))
-            if length > 0:
-                try:
-                    body = json.loads(self.rfile.read(length).decode("utf-8"))
-                    raw = str(body.get("pdf_dir", "")).strip()
-                    if raw:
-                        pdf_dir = raw
-                    date_subdir = bool(body.get("date_subdir"))
-                except json.JSONDecodeError:
-                    pass
-            try:
-                self.send_json(save_job_article(job_id, pdf_dir, date_subdir))
-            except RuntimeError as exc:
-                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-
-        if self.path.startswith("/api/jobs/") and self.path.endswith("/save-local"):
-            job_id = self.path.split("/")[-2]
-            try:
-                self.send_json(save_job_local(job_id))
-            except RuntimeError as exc:
-                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-
-        if self.path.startswith("/api/jobs/") and self.path.endswith("/save-drive"):
-            job_id = self.path.split("/")[-2]
-            try:
-                self.send_json(upload_job_to_drive(job_id))
-            except RuntimeError as exc:
-                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            return
-
-        if self.path.startswith("/api/jobs/") and self.path.endswith("/retry"):
-            job_id = self.path.rsplit("/", 2)[-2]
-            ok = _db.retry_job(job_id)
-            if ok:
-                self.send_json({"ok": True, "id": job_id})
-            else:
-                self.send_json({"ok": False, "error": "任务不存在或状态不允许重试"}, status=HTTPStatus.BAD_REQUEST)
-            return
-
-        if self.path == "/api/gdrive/auth-url":
-            try:
-                auth_url, state = gdrive_get_auth_url()
-                self.send_json({"url": auth_url, "state": state})
-            except FileNotFoundError as exc:
-                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
-            except Exception as exc:
-                self.send_json({"error": f"生成授权链接失败：{exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-
-        if self.path != "/api/jobs":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except json.JSONDecodeError:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
-            return
-
-        url = str(payload.get("url", "")).strip()
-        # Auto-prepend https:// if user pasted a bare URL
-        if url and not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        if not url.startswith(("http://", "https://")) or not ("bilibili.com" in url or "youtube.com" in url or "youtu.be" in url):
-            self.send_error(HTTPStatus.BAD_REQUEST, "请输入有效的 Bilibili 或 YouTube URL")
-            return
-
-        cookie_string = str(payload.get("cookie", "")).strip()
-        job_id = uuid.uuid4().hex[:12]
-        try:
-            _db.create_job(job_id=job_id, url=url, cookie_string=cookie_string)
-        except Exception as exc:
-            self.send_json({"error": f"创建任务失败：{exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
-            return
-        self.send_json({"id": job_id})
-
-    def send_file(self, path: Path, content_type: str) -> None:
-        if not path.exists():
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        data = path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_json(self, payload: Any, status: int = HTTPStatus.OK) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_html_page(self, title: str, message: str, auto_close: bool = False) -> None:
-        js_close = "<script>window.close();</script>" if auto_close else ""
-        html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><title>{title}</title>
-<style>
-  body {{ font-family: -apple-system, "SF Pro Display", "Segoe UI", sans-serif;
-         display:flex; align-items:center; justify-content:center; min-height:100vh;
-         margin:0; background:#f5f3ef; color:#1e2528; }}
-  .card {{ background:#fff; border-radius:12px; padding:32px 40px; box-shadow:0 4px 24px rgba(0,0,0,.08);
-           text-align:center; max-width:420px; }}
-  h2 {{ margin:0 0 8px; font-size:20px; }}
-  p {{ color:#667175; line-height:1.6; }}
-  .icon {{ font-size:48px; margin-bottom:12px; }}
-</style></head>
-<body><div class="card">
-  <div class="icon">{'✅' if auto_close else '❌'}</div>
-  <h2>{title}</h2><p>{message}</p>
-</div>{js_close}</body></html>"""
-        data = html.encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{self.client_address[0]} - {fmt % args}"
-        with open(ACCESS_LOG, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {msg}\n")
 
 
 def _job_article_items(job: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1906,77 +1563,62 @@ def _job_article_items(job: dict[str, Any]) -> list[tuple[str, str]]:
     return [(job["output_dir"], job["article"])]
 
 
-def save_job_local(job_id: str, pdf_dir: str | None = None, date_subdir: bool = False) -> dict[str, Any]:
-    """Save a finished job's article(s) as MD + PDF/HTML under docs/ (and the
-    configured extra pdf_dir).  Local only — no Google Drive upload."""
-    job = _db.get_job(job_id)
-    if not job:
-        raise RuntimeError("任务不存在")
+def job_download_files(job: dict[str, Any], fmt: str = "md") -> list[tuple[str, bytes]]:
+    """Build download payloads for a finished job's article(s).
+
+    Args:
+        job: Job dict (must be owned by the caller — checked in the web layer).
+        fmt: "md" | "html" | "pdf".
+
+    Returns a list of (filename, content) tuples — one per page for multi-page
+    jobs, a single entry otherwise.  HTML/PDF are rendered to a temp file and
+    read back, so nothing is persisted on disk.
+    """
     if job["status"] != "done" or not job["article"].strip():
-        raise RuntimeError("文章尚未生成，无法保存")
+        raise RuntimeError("文章尚未生成，无法下载")
 
-    t0 = time.time()
-    DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    cfg = load_config()
-    fmt = _local_save_format(cfg)
-    parts: list[str] = []
-    first_md_path = ""
-    first_file_path = ""
+    fmt = fmt.lower()
+    if fmt not in ("md", "html", "pdf"):
+        raise RuntimeError(f"不支持的下载格式：{fmt}")
 
-    for out_dir_item, art_item in _job_article_items(job):
-        stem = Path(out_dir_item).name
-        md_path = DOCS_DIR / f"{stem}.md"
-        md_path.write_text(art_item, encoding="utf-8")
-        written = _write_article_by_format(art_item, DOCS_DIR / stem, fmt)
-
-        if not first_md_path:
-            first_md_path = str(md_path)
-            first_file_path = str(written[0])
-
-        for p in written:
-            parts.append(f"📁 本地：{p}")
-
-        # 额外保存目录
-        pdf_dir_resolved = pdf_dir or str(cfg.get("pdf_dir", "")).strip()
-        if pdf_dir_resolved:
-            extra_dir = Path(pdf_dir_resolved)
-            if date_subdir or cfg.get("date_subdir"):
-                extra_dir = extra_dir / time.strftime("%Y%m%d")
-            extra_dir.mkdir(parents=True, exist_ok=True)
-            for p in written:
-                extra_file = extra_dir / p.name
-                shutil.copy2(p, extra_file)
-                parts.append(f"         → {extra_file}")
-
-    elapsed = time.time() - t0
-    summary = f"═══ 输出 ({elapsed:.1f}s) ═══\n" + "\n".join(parts)
-    try:
-        _db.update_job_log(job_id, summary, 100)
-    except Exception:
-        pass
-
-    return {"ok": True, "path": first_md_path, "pdf_path": first_file_path}
+    items = _job_article_items(job)
+    payloads: list[tuple[str, bytes]] = []
+    with tempfile.TemporaryDirectory(prefix="dl-") as tmp:
+        for out_dir_item, art_item in items:
+            stem = Path(out_dir_item).name or "article"
+            if fmt == "md":
+                payloads.append((f"{stem}.md", art_item.encode("utf-8")))
+                continue
+            ext = "html" if fmt == "html" else "pdf"
+            tmp_path = Path(tmp) / f"{stem}.{ext}"
+            if fmt == "html":
+                write_article_html(art_item, tmp_path)
+            else:
+                write_article_pdf(art_item, tmp_path)
+            payloads.append((tmp_path.name, tmp_path.read_bytes()))
+    return payloads
 
 
-def upload_job_to_drive(job_id: str) -> dict[str, Any]:
-    """Upload a finished job's article(s) to Google Drive (HTML or PDF per
-    current config).  Handles multi-page jobs by uploading every page."""
-    job = _db.get_job(job_id)
+def upload_job_to_drive(job_id: str, user_id: str) -> dict[str, Any]:
+    """Upload a finished job's article(s) to the user's Google Drive
+    (HTML or PDF per the user's settings).  Handles multi-page jobs by
+    uploading every page."""
+    job = _db.get_user_job(user_id, job_id)
     if not job:
         raise RuntimeError("任务不存在")
     if job["status"] != "done" or not job["article"].strip():
         raise RuntimeError("文章尚未生成，无法上传")
+    settings = _user_settings(user_id)
     try:
-        authed = gdrive_is_authenticated()
+        authed = gdrive_is_authenticated(user_id)
     except Exception:
         authed = False
     if not authed:
-        raise RuntimeError("Google Drive 未授权，请先在上方设置中完成授权")
+        raise RuntimeError("Google Drive 未授权，请先在设置中完成授权")
 
-    cfg = load_config()
-    gdrive_format = str(cfg.get("gdrive_format", "html")).strip().lower()
-    gdrive_folder = str(cfg.get("gdrive_folder_id", "")).strip()
-    use_date_subdir = bool(cfg.get("date_subdir"))
+    gdrive_format = str(settings.get("gdrive_format", "html")).strip().lower()
+    gdrive_folder = str(settings.get("gdrive_folder_id", "")).strip()
+    use_date_subdir = bool(settings.get("date_subdir"))
 
     links: list[str] = []
     for out_dir_item, art_item in _job_article_items(job):
@@ -1996,10 +1638,11 @@ def upload_job_to_drive(job_id: str) -> dict[str, Any]:
                 write_article_pdf(art_item, file_path)
             mime_type = "application/pdf"
 
-        target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir)
+        target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, user_id)
         if err:
             raise RuntimeError(f"Drive 上传失败：{err.get('message', '')}")
-        result = gdrive_upload_file(str(file_path), parent_folder_id=target_folder, mime_type=mime_type)
+        result = gdrive_upload_file(str(file_path), parent_folder_id=target_folder,
+                                    mime_type=mime_type, user_id=user_id)
         if result.get("status") != "success":
             raise RuntimeError(f"Drive 上传失败：{result.get('message', '')}")
         links.append(result["data"]["webViewLink"])
@@ -2009,31 +1652,6 @@ def upload_job_to_drive(job_id: str) -> dict[str, Any]:
     except Exception:
         pass
     return {"ok": True, "count": len(links), "links": links}
-
-
-def save_job_article(job_id: str, pdf_dir: str | None = None, date_subdir: bool = False) -> dict[str, Any]:
-    """Combined save: local MD+PDF, plus Drive upload when enabled
-    (single-page only — multi-page pages were uploaded during processing)."""
-    result = save_job_local(job_id, pdf_dir, date_subdir)
-
-    job = _db.get_job(job_id)
-    cfg = load_config()
-    is_multi = bool(job and job.get("page_output_dirs") and job.get("page_articles"))
-
-    # ── Google Drive（多集已在处理结束时逐集上传，此处跳过避免重复）──
-    if cfg.get("gdrive_enabled") and not is_multi:
-        parts: list[str] = []
-        try:
-            upload = upload_job_to_drive(job_id)
-            parts.extend(f"☁️ Drive：{link}" for link in upload["links"])
-        except Exception as exc:
-            parts.append(f"⚠️ Drive 失败：{exc}")
-        try:
-            _db.update_job_log(job_id, "\n".join(parts), 100)
-        except Exception:
-            pass
-
-    return {"path": result["path"], "pdf_path": result["pdf_path"]}
 
 
 def write_article_html(article: str, path: Path) -> None:
@@ -2639,6 +2257,10 @@ def _write_article_pdf_reportlab(article: str, path: Path) -> None:
             elif self._tag == "li":
                 self._list_items.append(text)
             elif self._tag == "pre":
+                # Code blocks may contain <br> (from markdown's &lt;br&gt;
+                # entity, which HTMLParser converts back) — reportlab's
+                # paraparser rejects them, so restore as newlines.
+                text = re.sub(r"<br\s*/?>", "\n", text)
                 self.flowables.append(XPreformatted(text, code_style))
             elif self._tag == "blockquote":
                 self.flowables.append(Paragraph(text, quote_style))
@@ -2690,20 +2312,9 @@ def register_pdf_font() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bilibili / YouTube 视频转写和文章整理工具")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=8000, type=int)
-    args = parser.parse_args()
-
-    _db.init_db()
-    STATIC_DIR.mkdir(exist_ok=True)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"Listening on http://{args.host}:{args.port}")
-    print("提示：请在新终端运行 python worker.py 启动后台任务处理")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n已停止")
+    """Legacy entry point — use ``python server.py`` for the web service.
+    Kept for compatibility with older scripts (start.sh etc. call server.py)."""
+    print("提示：请使用 python server.py 启动 Web 服务，并在新终端运行 python worker.py 启动后台任务处理")
 
 
 if __name__ == "__main__":

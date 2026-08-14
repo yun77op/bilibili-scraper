@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>设置 - 视频转文章</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <navbar current="settings"></navbar>
+
+      <main class="shell">
+        <section class="workspace">
+          <header class="topbar">
+            <div>
+              <h1>设置</h1>
+              <p>管理你的 Google Drive 上传与 YouTube 鉴权。</p>
+            </div>
+            <div class="topbar-right">
+              <div class="status-pill">{{ saveStatus }}</div>
+            </div>
+          </header>
+
+          <section class="config-section">
+            <div class="config-head">
+              <h3>☁️ Google Drive 上传</h3>
+              <button class="ghost" type="button" :disabled="saving" @click="save">保存设置</button>
+            </div>
+            <div class="config-body">
+              <div class="channel-group">
+                <label class="auto-save-label">
+                  <input type="checkbox" v-model="gdriveEnabled" />
+                  处理完成后自动上传到 Google Drive
+                </label>
+                <div class="gdrive-detail" :class="{ visible: gdriveEnabled }">
+                  <input
+                    type="text"
+                    v-model="gdriveFolder"
+                    placeholder="文件夹名称或 ID（如 bilibili文章，留空上传到根目录）"
+                    autocomplete="off"
+                  />
+                  <div class="gdrive-format-row">
+                    <label>上传格式：</label>
+                    <select v-model="gdriveFormat">
+                      <option value="html">HTML（手机阅读）</option>
+                      <option value="pdf">PDF（打印/归档）</option>
+                    </select>
+                  </div>
+                  <label class="auto-save-label">
+                    <input type="checkbox" v-model="dateSubdir" />
+                    按日期分目录（YYYYMMDD 子文件夹）
+                  </label>
+                  <div class="gdrive-auth-row">
+                    <span class="cookie-status">{{ gdriveStatusText }}</span>
+                    <button type="button" class="ghost" :disabled="gdriveBusy" @click="gdriveAuth">
+                      {{ gdriveAuthBtnText }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="config-section">
+            <div class="config-head">
+              <h3>🔐 YouTube 鉴权</h3>
+            </div>
+            <div class="config-body">
+              <div class="channel-group">
+                <div class="cookie-config">
+                  <textarea
+                    v-model="youtubeCookie"
+                    placeholder="粘贴 YouTube Cookie（Cookie-Editor 导出），留空保持现有配置"
+                    rows="3"
+                    autocomplete="off"
+                  ></textarea>
+                  <div class="cookie-row">
+                    <span class="cookie-status">{{ youtubeCookieStatusText }}</span>
+                    <button type="button" class="ghost" :disabled="youtubeBusy" @click="youtubeLogin">
+                      浏览器登录
+                    </button>
+                  </div>
+                  <span class="cookie-status">{{ youtubeLoginStatusText }}</span>
+                </div>
+                <p class="hint">部分 YouTube 视频需要登录后才能下载；保存设置后新任务将自动带上你的 Cookie。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="config-section" v-if="isAdmin">
+            <div class="config-head">
+              <h3>🛠 管理员</h3>
+            </div>
+            <div class="config-body">
+              <div class="channel-group">
+                <div class="channel-label">服务状态（只读）</div>
+                <div class="server-info">
+                  <p v-for="(line, i) in serverInfo" :key="i">{{ line }}</p>
+                </div>
+                <div class="channel-label">用户管理</div>
+                <div class="user-list">
+                  <div class="user-row" v-for="u in users" :key="u.id">
+                    <div class="user-info">
+                      <span class="user-name">{{ u.username }}</span>
+                      <span class="user-meta">
+                        {{ u.is_admin ? "管理员" : "普通用户" }} · 注册于 {{ fmtDate(u.created_at) }}
+                        <template v-if="u.last_login_at"> · 最近登录 {{ fmtDate(u.last_login_at) }}</template>
+                      </span>
+                    </div>
+                    <button
+                      v-if="!u.is_admin"
+                      class="ghost"
+                      @click="toggleUser(u)"
+                    >{{ u.is_active ? "禁用" : "启用" }}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/static/settings.js"></script>
+  </body>
+</html>

@@ -1,5 +1,5 @@
-param(
-    [int]$Port = 8000,
+﻿param(
+    [int]$Port = 8085,
     [string]$PythonPath = ""
 )
 
@@ -10,13 +10,16 @@ $pidDir = Join-Path $scriptDir ".pids"
 function Stop-ByPidFile {
     param([string]$PidFile, [string]$Name)
     if (Test-Path $PidFile) {
-        $pid = Get-Content $PidFile -Raw 2>$null
-        if ($pid) {
-            $pid = $pid.Trim()
-            $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        # Note: do NOT use $pid here — it collides with the read-only automatic
+        # variable $PID (current PowerShell process), which would cause the
+        # script to kill itself.
+        $procId = Get-Content $PidFile -Raw 2>$null
+        if ($procId) {
+            $procId = $procId.Trim()
+            $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
             if ($proc) {
-                Write-Host "Stopping $Name (PID: $pid)" -ForegroundColor Yellow
-                Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                Write-Host "Stopping $Name (PID: $procId)" -ForegroundColor Yellow
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
             }
         }
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
@@ -32,7 +35,7 @@ $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Silentl
 if ($conn -and $conn.OwningProcess -ne 0) {
     $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
     if ($proc) {
-        Write-Host "Stopping process on port $Port: $($proc.ProcessName) (PID: $($proc.Id))" -ForegroundColor Yellow
+        Write-Host "Stopping process on port ${Port}: $($proc.ProcessName) (PID: $($proc.Id))" -ForegroundColor Yellow
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
 }

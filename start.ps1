@@ -1,5 +1,5 @@
-param(
-    [int]$Port = 8000,
+﻿param(
+    [int]$Port = 8085,
     [string]$HostAddr = "127.0.0.1",
     [string]$PythonPath = ""
 )
@@ -8,7 +8,11 @@ $ErrorActionPreference = "Continue"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pidDir = Join-Path $scriptDir ".pids"
 $serverLog = Join-Path $scriptDir "server.log"
+$serverErrLog = Join-Path $scriptDir "server.err.log"
 $workerLog = Join-Path $scriptDir "worker.log"
+$workerErrLog = Join-Path $scriptDir "worker.err.log"
+
+. (Join-Path $scriptDir "python-detect.ps1")
 
 Write-Host "=== 视频转文章 — 启动 ===" -ForegroundColor Cyan
 
@@ -17,19 +21,10 @@ Write-Host "[1/3] 停止已有进程..." -ForegroundColor Gray
 & "$scriptDir\stop.ps1" -Port $Port 2>$null
 Start-Sleep -Seconds 1
 
-# 2. Detect Python
+# 2. Detect Python (shared logic: py launcher -> PATH -> common locations)
+$PythonPath = Find-Python -Override $PythonPath
 if (-not $PythonPath) {
-    $PythonPath = (Get-Command python -ErrorAction SilentlyContinue).Source
-}
-if (-not $PythonPath) {
-    $PythonPath = (Get-Command python3 -ErrorAction SilentlyContinue).Source
-}
-if (-not $PythonPath) {
-    # Fallback to the known codex runtime path
-    $PythonPath = "C:\Users\yun77\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-}
-if (-not (Test-Path $PythonPath)) {
-    Write-Host "ERROR: Python not found. Set -PythonPath or ensure python is in PATH." -ForegroundColor Red
+    Write-Host "ERROR: Python not found. Install Python 3.10+ or pass -PythonPath C:\path\to\python.exe" -ForegroundColor Red
     exit 1
 }
 
@@ -41,10 +36,10 @@ New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
 # 4. Start server
 Write-Host "[2/3] 启动 HTTP 服务（端口 $Port）..." -ForegroundColor Gray
 $serverProcess = Start-Process -FilePath $PythonPath `
-    -ArgumentList "server.py", "--host", $HostAddr, "--port", $Port `
+    -ArgumentList (Join-Path $scriptDir "server.py"), "--host", $HostAddr, "--port", $Port `
     -NoNewWindow -PassThru `
     -RedirectStandardOutput $serverLog `
-    -RedirectStandardError $serverLog
+    -RedirectStandardError $serverErrLog
 
 $serverProcess.Id | Out-File -FilePath (Join-Path $pidDir "server.pid") -NoNewline
 
@@ -75,10 +70,10 @@ Write-Host "  √ HTTP 服务已启动 (PID: $($serverProcess.Id))" -ForegroundC
 # 5. Start worker
 Write-Host "[3/3] 启动后台 Worker..." -ForegroundColor Gray
 $workerProcess = Start-Process -FilePath $PythonPath `
-    -ArgumentList "worker.py" `
+    -ArgumentList (Join-Path $scriptDir "worker.py") `
     -NoNewWindow -PassThru `
     -RedirectStandardOutput $workerLog `
-    -RedirectStandardError $workerLog
+    -RedirectStandardError $workerErrLog
 
 $workerProcess.Id | Out-File -FilePath (Join-Path $pidDir "worker.pid") -NoNewline
 
@@ -93,6 +88,8 @@ Write-Host ""
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
 Write-Host "  Web UI:  http://${HostAddr}:${Port}" -ForegroundColor White
 Write-Host "  Server log: $serverLog" -ForegroundColor Gray
+Write-Host "  Server err: $serverErrLog" -ForegroundColor Gray
 Write-Host "  Worker log: $workerLog" -ForegroundColor Gray
+Write-Host "  Worker err: $workerErrLog" -ForegroundColor Gray
 Write-Host "  停止服务:   .\stop.ps1" -ForegroundColor Gray
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan

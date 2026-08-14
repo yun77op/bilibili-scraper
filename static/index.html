@@ -4,145 +4,76 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>视频转文章 - Bilibili & YouTube</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="workspace">
-        <header class="topbar">
-          <div>
-            <h1>视频转文章</h1>
-            <p>支持 Bilibili、YouTube。优先读取字幕；没有字幕时自动下载音频并转写，再整理成文章。</p>
-          </div>
-          <div class="topbar-right">
-            <div class="worker-status" id="workerStatus" title="后台 Worker 状态">
-              <span class="worker-dot"></span>
-              <span class="worker-text">检测中…</span>
+    <div id="app">
+      <navbar current="index"></navbar>
+
+      <main class="shell">
+        <section class="workspace">
+          <header class="topbar">
+            <div>
+              <h1>视频转文章</h1>
+              <p>支持 Bilibili、YouTube。优先读取字幕；没有字幕时自动下载音频并转写，再整理成文章。</p>
             </div>
-            <div class="status-pill" id="statusPill">就绪</div>
-          </div>
-        </header>
-
-        <form id="jobForm" class="job-form">
-          <div id="urlInputs" class="url-rows">
-            <div class="url-row">
-              <input
-                class="url-input"
-                type="text"
-                placeholder="粘贴 B站 / YouTube 链接，按回车开始"
-                autocomplete="off"
-              />
-              <button class="url-row-btn add-row" type="button" title="添加一行">+</button>
-              <button class="url-row-btn remove-row" type="button" title="移除此行">−</button>
+            <div class="topbar-right">
+              <div class="worker-status" title="后台 Worker 状态">
+                <span class="worker-dot" :class="{ online: workerAlive === true, offline: workerAlive === false }"></span>
+                <span class="worker-text">{{ workerText }}</span>
+              </div>
+              <div class="status-pill">{{ statusPill }}</div>
             </div>
-          </div>
-          <button id="submitBtn" type="submit">全部开始</button>
-        </form>
+          </header>
 
-        <section class="config-section">
-          <div class="config-head">
-            <h3>输出设置</h3>
-            <button id="saveConfigBtn" class="ghost" type="button">保存配置</button>
-          </div>
-          <div class="config-body">
-            <!-- 输出渠道 -->
-            <div class="channel-group">
-              <div class="channel-label">📤 输出渠道</div>
-
-              <div class="channel-sub">
-                <span class="channel-sub-label">📁 本地文件</span>
+          <form class="job-form" @submit.prevent="submit">
+            <div class="url-rows">
+              <div class="url-row" v-for="(row, i) in rows" :key="i">
                 <input
-                  id="pdfDirInput"
+                  class="url-input"
                   type="text"
-                  placeholder="额外保存目录，如 ~/articles（可选）"
+                  placeholder="粘贴 B站 / YouTube 链接，按回车开始"
                   autocomplete="off"
+                  v-model="row.value"
                 />
-                <div class="gdrive-format-row">
-                  <label>保存格式：</label>
-                  <select id="saveFormatSelect">
-                    <option value="pdf">PDF（打印/归档）</option>
-                    <option value="html">HTML（浏览器阅读）</option>
-                    <option value="both">PDF + HTML</option>
-                  </select>
-                </div>
-                <label class="auto-save-label">
-                  <input type="checkbox" id="autoSaveCheck" />
-                  处理完成后自动保存
-                </label>
-              </div>
-
-              <div class="channel-sub">
-                <span class="channel-sub-label">☁️ Google Drive</span>
-                <label class="auto-save-label">
-                  <input type="checkbox" id="gdriveCheck" />
-                  上传到 Google Drive
-                </label>
-                <div class="gdrive-detail" id="gdriveDetail">
-                  <input
-                    id="gdriveFolderInput"
-                    type="text"
-                    placeholder="文件夹名称或 ID（如 bilibili文章，留空上传到根目录）"
-                    autocomplete="off"
-                  />
-                  <div class="gdrive-format-row">
-                    <label>上传格式：</label>
-                    <select id="gdriveFormatSelect">
-                      <option value="html">HTML（手机阅读）</option>
-                      <option value="pdf">PDF（打印/归档）</option>
-                    </select>
-                  </div>
-                  <div class="gdrive-auth-row">
-                    <span id="gdriveStatus" class="cookie-status">未授权</span>
-                    <button id="gdriveAuthBtn" type="button" class="ghost">授权 Google Drive</button>
-                  </div>
-                </div>
-              </div>
-
-              <label class="auto-save-label">
-                <input type="checkbox" id="dateSubdirCheck" />
-                按日期分目录（本地与 Drive 均生效）
-              </label>
-            </div>
-
-            <!-- 鉴权 -->
-            <div class="channel-group">
-              <div class="channel-label">🔐 YouTube 鉴权</div>
-              <div class="cookie-config">
-                <textarea
-                  id="youtubeCookieInput"
-                  placeholder="粘贴 YouTube Cookie（Cookie-Editor 导出）"
-                  rows="3"
-                  autocomplete="off"
-                ></textarea>
-                <div class="cookie-row">
-                  <span id="youtubeCookieStatus" class="cookie-status">未配置</span>
-                  <button id="youtubeLoginBtn" type="button" class="ghost">浏览器登录</button>
-                </div>
-                <span id="youtubeLoginStatus" class="cookie-status"></span>
+                <button class="url-row-btn add-row" type="button" title="添加一行" @click="addRow">+</button>
+                <button
+                  class="url-row-btn remove-row"
+                  type="button"
+                  title="移除此行"
+                  @click="removeRow(i)"
+                  :style="{ display: rows.length <= 1 ? 'none' : '' }"
+                >−</button>
               </div>
             </div>
-          </div>
-        </section>
+            <button id="submitBtn" type="submit" :disabled="submitting">
+              {{ submitting ? '提交中…' : '全部开始' }}
+            </button>
+          </form>
 
-        <div class="status-row" aria-label="处理状态">
-          <div class="progress-wrap">
-            <div class="progress-bar" id="progressBar"></div>
-          </div>
-          <div class="status-info">
-            <span id="stageText">等待输入链接</span>
-            <span id="elapsedText" class="elapsed"></span>
-          </div>
-        </div>
+          <p id="stageText" aria-label="处理状态">{{ stageText }}</p>
 
-        <section class="job-history" id="jobHistory">
-          <div class="job-history-head">
-            <h2>📋 任务历史</h2>
-            <span class="job-count" id="jobCount"></span>
-          </div>
-          <div class="job-list" id="jobList"></div>
+          <section class="job-history">
+            <div class="job-history-head">
+              <h2>📋 任务历史</h2>
+              <span class="job-count">{{ jobCountText }}</span>
+            </div>
+            <div class="job-list">
+              <p class="job-empty" v-if="jobs.length === 0">暂无历史任务</p>
+              <job-item v-for="job in jobs" :key="job.id" :job="job" @refresh="loadJobs"></job-item>
+            </div>
+            <div class="pagination" v-if="pages > 1">
+              <button class="page-btn" :disabled="page <= 1" @click="goPage(page - 1)">‹ 上一页</button>
+              <template v-for="p in pageItems" :key="p">
+                <span v-if="p === '…'" class="page-ellipsis">…</span>
+                <button v-else class="page-btn" :class="{ active: p === page }" @click="goPage(p)">{{ p }}</button>
+              </template>
+              <button class="page-btn" :disabled="page >= pages" @click="goPage(page + 1)">下一页 ›</button>
+            </div>
+          </section>
         </section>
-      </section>
-    </main>
-    <script src="/app.js"></script>
+      </main>
+    </div>
+    <script type="module" src="/static/app.js"></script>
   </body>
 </html>

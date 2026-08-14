@@ -5,7 +5,7 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 默认值，可通过环境变量 PORT / HOST 覆盖
-PORT="${PORT:-8000}"
+PORT="${PORT:-8085}"
 HOST="${HOST:-127.0.0.1}"
 
 PID_DIR="$SCRIPT_DIR/.pids"

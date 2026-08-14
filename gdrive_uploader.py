@@ -48,9 +48,9 @@ def check_dependencies() -> list[str]:
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 DEFAULT_CREDENTIALS_PATH = os.path.expanduser("~/.gdrive-credentials.json")
 DEFAULT_TOKEN_PATH = os.path.expanduser("~/.gdrive-token.json")
+TOKENS_DIR = os.path.expanduser("~/.gdrive-tokens")
 
 # In-memory store for pending OAuth flows, keyed by state token.
-# (single-user local app, so a dict is fine)
 _pending_flows: dict[str, InstalledAppFlow] = {}
 
 
@@ -123,18 +123,26 @@ def _build_http() -> Any:
 # Authentication
 # ---------------------------------------------------------------------------
 
-def _credential_paths() -> tuple[str, str]:
+def _credential_paths(user_id: str | None = None) -> tuple[str, str]:
     creds_path = os.environ.get("GDRIVE_CREDENTIALS_PATH", DEFAULT_CREDENTIALS_PATH)
-    token_path = os.environ.get("GDRIVE_TOKEN_PATH", DEFAULT_TOKEN_PATH)
+    if user_id:
+        # Per-user token: ~/.gdrive-tokens/{user_id}.json
+        token_path = os.path.join(TOKENS_DIR, f"{user_id}.json")
+    else:
+        token_path = os.environ.get("GDRIVE_TOKEN_PATH", DEFAULT_TOKEN_PATH)
     return creds_path, token_path
 
 
-def get_credentials() -> Credentials | None:
+def get_credentials(user_id: str | None = None) -> Credentials | None:
     """Get valid user credentials from storage, refreshing if needed.
+
+    Args:
+        user_id: User account id for per-user token storage.  When None the
+                 legacy single-user token path is used.
 
     Returns a valid Credentials object, or None if (re-)authentication is required.
     """
-    _, token_path = _credential_paths()
+    _, token_path = _credential_paths(user_id)
 
     creds: Credentials | None = None
     if os.path.exists(token_path):
@@ -158,7 +166,7 @@ def get_credentials() -> Credentials | None:
     return None
 
 
-def get_service() -> tuple[Any | None, dict[str, Any] | None]:
+def get_service(user_id: str | None = None) -> tuple[Any | None, dict[str, Any] | None]:
     """Return (service, error) — exactly one is non-None.
 
     On success: (Drive service object, None)
@@ -170,8 +178,8 @@ def get_service() -> tuple[Any | None, dict[str, Any] | None]:
             "message": f"缺少 Google Drive 依赖：{', '.join(_MISSING_DEPS)}。请执行 pip install {' '.join(_MISSING_DEPS)}",
         }
 
-    creds = get_credentials()
-    creds_path, token_path = _credential_paths()
+    creds = get_credentials(user_id)
+    creds_path, token_path = _credential_paths(user_id)
 
     if not creds:
         if not os.path.exists(creds_path):
@@ -204,17 +212,17 @@ def get_service() -> tuple[Any | None, dict[str, Any] | None]:
         }
 
 
-def is_authenticated() -> bool:
-    """Return True if a valid Google Drive token exists."""
-    return get_credentials() is not None
+def is_authenticated(user_id: str | None = None) -> bool:
+    """Return True if a valid Google Drive token exists for the given user."""
+    return get_credentials(user_id) is not None
 
 
-def get_auth_url(redirect_uri: str = "http://localhost:8000/api/gdrive/callback") -> tuple[str, str]:
+def get_auth_url(redirect_uri: str = "http://localhost:8085/api/gdrive/callback") -> tuple[str, str]:
     """Generate Google OAuth authorization URL.
 
     Returns (auth_url, state_token).  The state_token must be passed to exchange_code() later.
     """
-    creds_path, _ = _credential_paths()
+    creds_path, _ = _credential_paths(None)
     if not os.path.exists(creds_path):
         raise FileNotFoundError(
             f"OAuth 凭据文件不存在：{creds_path}\n"
@@ -235,8 +243,14 @@ def get_auth_url(redirect_uri: str = "http://localhost:8000/api/gdrive/callback"
     return auth_url, state
 
 
-def exchange_code(code: str, state: str) -> tuple[bool, str]:
+def exchange_code(code: str, state: str, user_id: str | None = None) -> tuple[bool, str]:
     """Exchange authorization code for credentials and save token.
+
+    Args:
+        code: OAuth authorization code from the redirect query string.
+        state: State token returned by get_auth_url().
+        user_id: User account id — the token is stored per-user under
+                 ~/.gdrive-tokens/{user_id}.json.
 
     Returns (success, message).
     """
@@ -244,7 +258,7 @@ def exchange_code(code: str, state: str) -> tuple[bool, str]:
     if flow is None:
         return False, "无效的 state 参数，可能已过期或重复使用。请重新发起授权。"
 
-    _, token_path = _credential_paths()
+    _, token_path = _credential_paths(user_id)
     try:
         flow.fetch_token(code=code)
         creds = flow.credentials
@@ -260,18 +274,20 @@ def exchange_code(code: str, state: str) -> tuple[bool, str]:
 # Upload
 # ---------------------------------------------------------------------------
 
-def find_or_create_folder(name: str, parent_id: str = "") -> tuple[str | None, dict[str, Any] | None]:
+def find_or_create_folder(name: str, parent_id: str = "",
+                          user_id: str | None = None) -> tuple[str | None, dict[str, Any] | None]:
     """Find an existing folder by name under parent, or create one.
 
     Args:
         name: Folder name to find or create.
         parent_id: Parent folder ID (empty = root).
+        user_id: User account id for per-user Drive credentials.
 
     Returns:
         (folder_id, error).  folder_id is the Drive folder ID on success.
         error is a dict with "error" and "message" keys on failure.
     """
-    service, err = get_service()
+    service, err = get_service(user_id)
     if err:
         return None, err
 
@@ -314,7 +330,7 @@ def find_or_create_folder(name: str, parent_id: str = "") -> tuple[str | None, d
 
 
 def upload_file(local_path: str, parent_folder_id: str = "", file_name: str = "",
-                mime_type: str = "") -> dict[str, Any]:
+                mime_type: str = "", user_id: str | None = None) -> dict[str, Any]:
     """Upload a single file to Google Drive.
 
     Args:
@@ -322,6 +338,7 @@ def upload_file(local_path: str, parent_folder_id: str = "", file_name: str = ""
         parent_folder_id: Google Drive folder ID (empty = root).
         file_name: Custom name on Drive (default: basename of local_path).
         mime_type: MIME type (default: auto-detected).
+        user_id: User account id for per-user Drive credentials.
 
     Returns:
         {"status": "success", "data": {...}} or {"status": "error", ...}
@@ -330,7 +347,7 @@ def upload_file(local_path: str, parent_folder_id: str = "", file_name: str = ""
         return {"status": "error", "error": "file_not_found",
                 "message": f"本地文件不存在：{local_path}"}
 
-    service, err = get_service()
+    service, err = get_service(user_id)
     if err:
         return {"status": "error", **err}
 
@@ -364,7 +381,7 @@ def upload_file(local_path: str, parent_folder_id: str = "", file_name: str = ""
         return {"status": "error", "error": "api_error", "message": str(exc)}
 
 
-def _resolve_folder_id(folder_id: str) -> tuple[str | None, dict[str, Any] | None]:
+def _resolve_folder_id(folder_id: str, user_id: str | None = None) -> tuple[str | None, dict[str, Any] | None]:
     """Resolve a folder ID or name to a Drive folder ID.
 
     If folder_id looks like a Drive ID (alphanumeric, 20+ chars), use it directly.
@@ -378,12 +395,13 @@ def _resolve_folder_id(folder_id: str) -> tuple[str | None, dict[str, Any] | Non
     if re.fullmatch(r"[a-zA-Z0-9_-]{20,}", folder_id):
         return folder_id, None
     # Treat as folder name
-    return find_or_create_folder(folder_id)
+    return find_or_create_folder(folder_id, user_id=user_id)
 
 
 def upload_article_files(md_path: str, pdf_path: str,
                          folder_id: str = "",
-                         date_subdir: bool = False) -> list[dict[str, Any]]:
+                         date_subdir: bool = False,
+                         user_id: str | None = None) -> list[dict[str, Any]]:
     """Upload article PDF to Google Drive (MD skipped by default).
 
     Args:
@@ -392,16 +410,17 @@ def upload_article_files(md_path: str, pdf_path: str,
         folder_id: Google Drive folder ID or name (empty = root).
                    If it looks like a name (non-ID), it will be searched/created.
         date_subdir: If True, create/find a YYYYMMDD subfolder under folder_id.
+        user_id: User account id for per-user Drive credentials.
 
     Returns a list of result dicts, one per uploaded file.
     """
-    target_folder, err = _resolve_folder_id(folder_id)
+    target_folder, err = _resolve_folder_id(folder_id, user_id)
     if err:
         return [{"status": "error", **err}]
     if date_subdir:
         import time as _time
         date_name = _time.strftime("%Y%m%d")
-        found_id, err = find_or_create_folder(date_name, target_folder or "")
+        found_id, err = find_or_create_folder(date_name, target_folder or "", user_id=user_id)
         if err:
             return [{"status": "error", **err}]
         target_folder = found_id or folder_id
@@ -411,7 +430,7 @@ def upload_article_files(md_path: str, pdf_path: str,
     for path in (pdf_path,):
         if os.path.exists(path):
             results.append(upload_file(path, parent_folder_id=target_folder,
-                                       mime_type="application/pdf"))
+                                       mime_type="application/pdf", user_id=user_id))
         else:
             results.append({
                 "status": "error", "error": "file_not_found",

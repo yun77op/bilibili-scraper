@@ -1,11 +1,18 @@
 # 视频转文章
 
-本项目提供一个本地 Web UI：输入 Bilibili 或 YouTube 视频 URL，自动获取字幕或下载音频转写，再整理成文章。
+带用户体系的 Web 服务：输入 Bilibili 或 YouTube 视频 URL，自动获取字幕或下载音频转写，再整理成文章。支持多用户注册登录、任务数据隔离、每用户独立授权 Google Drive 上传。
 
 | 平台 | 实现方式 |
 |------|----------|
 | Bilibili | 直接调用 Bilibili 视频信息和播放地址接口 |
 | YouTube | yt-dlp 获取元数据、字幕和音频 |
+
+## 用户体系
+
+- 开放注册，密码使用 scrypt 哈希存储；登录失败 5 次锁定 15 分钟
+- **第一个注册的用户自动成为管理员**，并可看到旧数据（升级前已有任务自动归入管理员）
+- 每个用户只能看到、操作自己的任务；文章可在线查看、复制、下载（MD / HTML / PDF），或上传到自己的 Google Drive
+- 设置页（`/settings`）为独立页面：Google Drive 授权与上传偏好、YouTube Cookie 为每用户设置；DeepSeek / Whisper 等全局配置仅管理员可见
 
 ## 准备环境
 
@@ -88,21 +95,7 @@ WHISPER_DEVICE=auto
 WHISPER_COMPUTE_TYPE=auto
 WHISPER_MODEL=base
 TRANSCRIBE_LANGUAGE=zh
-```
-
-**Windows (PowerShell)**
-
-```powershell
-DEEPSEEK_API_KEY=sk-your-api-key
-DEEPSEEK_MODEL=deepseek-v4-pro
-BILIBILI_PROXY=http://127.0.0.1:7897
-HTTP_PROXY=http://127.0.0.1:7897
-HTTPS_PROXY=http://127.0.0.1:7897
-HF_HUB_DISABLE_XET=1
-WHISPER_DEVICE=auto
-WHISPER_COMPUTE_TYPE=auto
-WHISPER_MODEL=base
-TRANSCRIBE_LANGUAGE=zh
+FLASK_SECRET_KEY=    # 会话签名密钥；不填则首次启动自动生成并写入 .env.local
 ```
 
 `BILIBILI_PROXY` 同时用于 Bilibili API 和 YouTube 访问，所有网络请求（包括模型下载）都会经过该代理。
@@ -139,11 +132,10 @@ $env:BILIBILI_COOKIES_FILE="C:\path\to\cookies.txt"
 
 YouTube 公开视频一般不需要 Cookie。如果遇到 "Sign in to confirm you're not a bot" 这类错误，需要登录 Cookie：
 
-1. 用 Chrome 登录 youtube.com
-2. 用 Cookie-Editor 扩展导出 `youtube.com` 的 Netscape 格式
-3. 保存到项目目录 `youtube-cookies.txt`（已加入 `.gitignore`）
+1. 在设置页把 Cookie 粘贴到「YouTube 鉴权」输入框并保存（每用户独立），新任务会自动带上
+2. 也可以在设置页点击「浏览器登录」，在服务器弹出的浏览器中登录 YouTube 后自动保存 Cookie
 
-系统会自动读取该文件，无需额外配置。也可以用环境变量指定路径：
+也可以用环境变量为整个服务指定一份默认 Cookie：
 
 **macOS / Linux**
 
@@ -157,28 +149,38 @@ export YOUTUBE_COOKIES_FILE="/path/to/youtube-cookies.txt"
 $env:YOUTUBE_COOKIES_FILE="C:\path\to\youtube-cookies.txt"
 ```
 
+## Google Drive（可选，每用户独立）
+
+文章可自动或手动上传到 Google Drive：
+
+1. 服务器上放置 OAuth 客户端凭据：从 Google Cloud Console 下载 OAuth 2.0 桌面客户端 JSON，保存为 `~/.gdrive-credentials.json`（所有用户共用这份客户端，token 按用户分开存于 `~/.gdrive-tokens/`）
+2. 每个用户在设置页点击「授权 Google Drive」完成自己的 OAuth 授权
+3. 设置上传开关、目标文件夹（名称或 ID）、格式（HTML / PDF）与是否按日期分目录；处理完成自动上传，也可在任务列表点 ☁️ 手动上传
+
 ## 启动
 
 **macOS / Linux**
 
 ```bash
-python3 app.py
+python3 server.py    # Web 服务（Flask + waitress，默认端口 8085）
+python3 worker.py    # 后台任务处理（另开终端）
 ```
 
 **Windows**
 
 ```powershell
-python app.py
+python server.py
+python worker.py
 ```
 
-打开 http://127.0.0.1:8000
+打开 http://127.0.0.1:8085，首次使用先注册账号（第一个注册用户为管理员）。
 
 ### 脚本管理
 
 **macOS / Linux**
 
 ```bash
-./restart.sh    # 停止旧进程并后台启动（默认端口 8000）
+./restart.sh    # 停止旧进程并后台启动（默认端口 8085）
 ./stop.sh       # 停止服务
 ```
 
@@ -192,15 +194,23 @@ PORT=8080 ./stop.sh
 **Windows**
 
 ```powershell
-.\restart.ps1    # 停止旧进程并启动（默认端口 8000）
+.\restart.ps1    # 停止旧进程并启动（默认端口 8085）
 .\stop.ps1       # 停止服务
 ```
 
 ## 输出
 
-处理结果保存到 `outputs/` 目录，按 `YYYYMMDD-{平台}-{ID}-{标题}` 命名：
+处理过程中的中间文件（音频、字幕、转写稿）保存在 `outputs/` 目录（按 `YYYYMMDD-{平台}-{ID}-{标题}` 命名），同名视频会复用缓存避免重复转写。
 
-- `transcript.txt` — 转写稿（带时间戳）
-- `article.md` — DeepSeek 整理后的文章
+最终文章不落盘归档，在任务历史中展开即可：
 
-页面里的"保存到 docs"按钮会把文章另存到 `docs/` 目录，同时生成 `.md` 和 `.pdf`（可在输出设置中把保存格式改为 HTML 或 PDF + HTML；HTML 中的公式和 Mermaid 流程图通过 CDN 渲染，打开时需联网）。
+- 📄 **文章 / 📝 转写稿**：在线查看 + 一键复制
+- **下载 MD / HTML / PDF**：浏览器直接下载（多分P任务自动打包为 zip）
+- ☁️ **上传到 Google Drive**：手动上传到自己的网盘
+
+## 对外部署
+
+- 建议部署在公网服务器（Linux），用 Nginx / Caddy 等反代到 8085 端口并启用 HTTPS（登录 Cookie 自动带 `Secure` 标志）
+- 生产环境建议多线程：`python server.py --host 0.0.0.0 --port 8085 --threads 8`
+- 管理员可在设置页底部查看 DeepSeek / Whisper / Worker 状态，并禁用恶意用户
+- 升级自旧版（无用户体系）时无需迁移：旧任务数据保留，第一个注册的管理员自动继承

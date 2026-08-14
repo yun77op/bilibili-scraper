@@ -3,7 +3,7 @@ set -eu
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${PORT:-8000}"
+PORT="${PORT:-8085}"
 
 echo "=== video-scraper restart ==="
 bash "$SCRIPT_DIR/stop.sh" "$PORT"
