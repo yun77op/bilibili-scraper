@@ -311,6 +311,8 @@ def create_app() -> Flask:
             return jsonify({"url": auth_url, "state": state})
         except FileNotFoundError as exc:
             return jsonify({"error": str(exc)}), 400
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": f"生成授权链接失败：{exc}"}), 500
 

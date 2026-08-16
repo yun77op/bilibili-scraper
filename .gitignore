@@ -8,12 +8,13 @@ docs/
 .env.local
 config.json
 .browser-data/
-server.log
+logs/
 youtube-cookies.txt
 .gdrive-token.json
+.gdrive-credentials.json
+.gdrive-tokens/
 jobs.db
 jobs.db-wal
 jobs.db-shm
 .pids/
-worker.log
 .DS_Store

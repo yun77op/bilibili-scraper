@@ -1,4 +1,4 @@
-﻿param(
+param(
     [int]$Port = 8085,
     [string]$HostAddr = "127.0.0.1",
     [string]$PythonPath = ""
@@ -7,10 +7,11 @@
 $ErrorActionPreference = "Continue"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pidDir = Join-Path $scriptDir ".pids"
-$serverLog = Join-Path $scriptDir "server.log"
-$serverErrLog = Join-Path $scriptDir "server.err.log"
-$workerLog = Join-Path $scriptDir "worker.log"
-$workerErrLog = Join-Path $scriptDir "worker.err.log"
+$logsDir = Join-Path $scriptDir "logs"
+$serverLog = Join-Path $logsDir "server.log"
+$serverErrLog = Join-Path $logsDir "server.err.log"
+$workerLog = Join-Path $logsDir "worker.log"
+$workerErrLog = Join-Path $logsDir "worker.err.log"
 
 . (Join-Path $scriptDir "python-detect.ps1")
 
@@ -30,8 +31,9 @@ if (-not $PythonPath) {
 
 Write-Host "Python: $PythonPath" -ForegroundColor Gray
 
-# 3. Create PID directory
+# 3. Create PID and log directories
 New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
+New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
 # 4. Start server
 Write-Host "[2/3] 启动 HTTP 服务（端口 $Port）..." -ForegroundColor Gray

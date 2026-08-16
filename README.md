@@ -153,9 +153,13 @@ $env:YOUTUBE_COOKIES_FILE="C:\path\to\youtube-cookies.txt"
 
 文章可自动或手动上传到 Google Drive：
 
-1. 服务器上放置 OAuth 客户端凭据：从 Google Cloud Console 下载 OAuth 2.0 桌面客户端 JSON，保存为 `~/.gdrive-credentials.json`（所有用户共用这份客户端，token 按用户分开存于 `~/.gdrive-tokens/`）
-2. 每个用户在设置页点击「授权 Google Drive」完成自己的 OAuth 授权
-3. 设置上传开关、目标文件夹（名称或 ID）、格式（HTML / PDF）与是否按日期分目录；处理完成自动上传，也可在任务列表点 ☁️ 手动上传
+1. 放置 OAuth 客户端凭据：从 Google Cloud Console 下载 OAuth 2.0 客户端 JSON，保存为项目内 `.gdrive-credentials.json`（所有用户共用这份客户端；也可用环境变量 `GDRIVE_CREDENTIALS_PATH` 指定其它路径，旧路径 `~/.gdrive-credentials.json` 仍兼容）。每个用户的授权 token 存入数据库 `jobs.db` 的 `gdrive_tokens` 表（按 user_id 分开）；旧的 `.gdrive-tokens/` 文件会在首次使用时自动迁移进数据库并删除
+2. 客户端类型注意（选择错误会在授权时报 `redirect_uri_mismatch`）：
+   - 仅本机 / SSH 隧道（localhost 访问）→ 下载**「桌面应用」**类型即可
+   - 用户通过**局域网 IP 或域名**访问 → 必须用**「Web 应用」**类型，并在 Google Cloud Console → 凭据 → OAuth 客户端 ID → **「授权重定向 URI」**中添加 `http(s)://你的访问地址/api/gdrive/callback`（例如 `http://192.168.1.10:8085/api/gdrive/callback`）
+   - OAuth 同意屏幕需设为**「生产环境」**，否则非测试用户无法授权
+3. 每个用户在设置页点击「授权 Google Drive」完成自己的 OAuth 授权
+4. 设置上传开关、目标文件夹（名称或 ID）、格式（HTML / PDF）与是否按日期分目录；处理完成自动上传，也可在任务列表点 ☁️ 手动上传
 
 ## 启动
 

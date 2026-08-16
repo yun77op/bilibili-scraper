@@ -9,8 +9,9 @@ PORT="${PORT:-8085}"
 HOST="${HOST:-127.0.0.1}"
 
 PID_DIR="$SCRIPT_DIR/.pids"
-SERVER_LOG="$SCRIPT_DIR/server.log"
-WORKER_LOG="$SCRIPT_DIR/worker.log"
+LOG_DIR="$SCRIPT_DIR/logs"
+SERVER_LOG="$LOG_DIR/server.log"
+WORKER_LOG="$LOG_DIR/worker.log"
 
 echo "=== 视频转文章 — 启动 ==="
 
@@ -33,8 +34,9 @@ if [ -z "$PYTHON" ]; then
 fi
 echo "Python: $($PYTHON --version)"
 
-# 3. 创建 PID 目录
+# 3. 创建 PID 与日志目录
 mkdir -p "$PID_DIR"
+mkdir -p "$LOG_DIR"
 
 # 4. 启动 HTTP 服务
 echo "[2/3] 启动 HTTP 服务（端口 ${PORT}）..."

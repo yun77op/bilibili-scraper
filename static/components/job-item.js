@@ -1,4 +1,4 @@
-// 任务条目组件：状态徽章、展开详情（文章/HTML/转写稿/日志 tab）、操作按钮
+// 任务条目组件：状态徽章、展开详情（HTML/转写稿/日志 tab）、操作按钮
 // 展开状态与 tab 是组件内部状态，列表刷新时 Vue 按 :key 保留实例，不重建
 import { api } from "/static/common.js";
 import { marked } from "/static/vendor/marked/marked.esm.min.js";
@@ -81,6 +81,63 @@ const BADGE_MAP = {
   cancelled: ["已取消", "badge-cancelled"],
 };
 
+// ── Markdown 强调标记修复 ─────────────────────────
+// 模型偶尔会在 ** 与文字之间多打空格（如 "** 文字**"），CommonMark 规定 ** 后
+// 不能紧跟空格才算加粗开始，导致标记失效、** 裸露。渲染前剥离内层首尾空白，
+// 与后端 app.py 的 _fix_emphasis_spacing 保持一致。只修首尾空白，内部空格不动。
+const EMPH_SPACE_RE = /\*\*([^*\n]+?)\*\*/g;
+
+function fixEmphasisSpacing(md) {
+  return md.replace(EMPH_SPACE_RE, (whole, inner) => {
+    const stripped = inner.trim();
+    return stripped !== inner ? `**${stripped}**` : whole;
+  });
+}
+
+// ── LaTeX 数学公式保护 ─────────────────────────────
+// Markdown 会把公式里的下划线（\mathcal{L}_{aux} 的 _）当成强调语法转成 <em>，
+// 破坏公式并让 KaTeX 无法匹配 $$...$$ 等分隔符。转换前先把数学段（及围栏代码块）
+// 替换为占位符，转换后再还原，与后端 app.py 的 _protect_math_segments 保持一致。
+const MATH_PLACEHOLDER = "KATEXMATHSEG{}Z";
+const MATH_SEGMENT_RE = /```[\s\S]*?```|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
+
+function protectMathSegments(md) {
+  const segments = [];
+  const protectedMd = md.replace(MATH_SEGMENT_RE, (m) => {
+    segments.push(m);
+    return MATH_PLACEHOLDER.replace("{}", segments.length - 1);
+  });
+  return { protectedMd, segments };
+}
+
+function escapeHtmlText(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function restoreMathSegments(html, segments) {
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const placeholder = MATH_PLACEHOLDER.replace("{}", i);
+    if (seg.startsWith("```")) {
+      // 围栏代码块：还原为 <pre><code class="language-...">（mermaid 依赖该结构）
+      let body = seg.slice(3);
+      const firstNl = body.indexOf("\n");
+      const info = firstNl !== -1 ? body.slice(0, firstNl).trim() : "";
+      body = firstNl !== -1 ? body.slice(firstNl + 1) : "";
+      if (body.replace(/\n+$/, "").endsWith("```")) {
+        body = body.replace(/\n+$/, "").slice(0, -3);
+      }
+      const langCls = info ? ` class="language-${info}"` : "";
+      const codeHtml = `<pre><code${langCls}>${escapeHtmlText(body.trim())}</code></pre>`;
+      const wrapped = `<p>${placeholder}</p>`;
+      html = html.includes(wrapped) ? html.replace(wrapped, codeHtml) : html.split(placeholder).join(codeHtml);
+    } else {
+      html = html.split(placeholder).join(escapeHtmlText(seg));
+    }
+  }
+  return html;
+}
+
 function truncateUrl(url) {
   if (!url) return "";
   return url.length > 60 ? url.slice(0, 60) + "…" : url;
@@ -105,12 +162,13 @@ export default {
   data() {
     return {
       expanded: false,
-      activeTab: "article",
+      activeTab: "html", // 默认展示渲染后的 HTML（不展示 markdown 原文）
       activePage: 0, // 合集任务当前查看的篇目（0-based）
       busy: null, // retry | cancel | delete | drive
       htmlContent: null, // HTML 渲染结果（懒渲染缓存）
       htmlRenderedFor: null, // 已渲染的文章内容，列表轮询内容不变时不重渲
       readerOpen: false, // 阅读模式弹窗是否打开
+      downloadMenuOpen: false, // 下载下拉菜单是否展开
     };
   },
   computed: {
@@ -131,7 +189,6 @@ export default {
       const job = this.job;
       if (job.status === "done" && job.article) {
         const list = [
-          { key: "article", label: "📄 文章" },
           { key: "html", label: "🌐 HTML" },
         ];
         if (job.transcript) list.push({ key: "transcript", label: "📝 转写稿" });
@@ -173,7 +230,7 @@ export default {
     job() {
       // 状态变化后，若当前 tab 已不存在则回落到第一个
       if (!this.tabs.some((t) => t.key === this.activeTab)) {
-        this.activeTab = this.tabs.length ? this.tabs[0].key : "article";
+        this.activeTab = this.tabs.length ? this.tabs[0].key : "html";
       }
       // 合集被重试清空或篇目数变化时，回落第一篇
       if (!this.isMultiPage) this.activePage = 0;
@@ -184,12 +241,22 @@ export default {
         this.renderRichAfterTick();
       }
     },
+    downloadMenuOpen(open) {
+      // 展开时监听文档点击，点击菜单外部收起
+      if (open) document.addEventListener("click", this.onDocClick);
+      else document.removeEventListener("click", this.onDocClick);
+    },
   },
   methods: {
     truncateUrl, // 模板里使用，需挂到组件实例上
     toggle() {
       if (this.tabs.length === 0) return;
       this.expanded = !this.expanded;
+      // 展开时若默认落在 HTML tab，需要惰性渲染文章
+      if (this.expanded && this.activeTab === "html") {
+        this.renderHtml();
+        this.renderRichAfterTick();
+      }
     },
     switchTab(key) {
       this.activeTab = key;
@@ -198,11 +265,33 @@ export default {
         this.renderRichAfterTick();
       }
     },
+    // ── 下载下拉菜单 ─────────────────────────────
+    // 默认动作下载 HTML；展开后可选择 MD / HTML / PDF
+    toggleDownloadMenu() {
+      this.downloadMenuOpen = !this.downloadMenuOpen;
+    },
+    closeDownloadMenu() {
+      this.downloadMenuOpen = false;
+    },
+    downloadChoice(fmt) {
+      this.downloadMenuOpen = false;
+      this.download(fmt);
+    },
+    onDocClick(e) {
+      // 点击菜单外部（当前组件之外）时收起
+      if (this.downloadMenuOpen && !(this.$el && this.$el.contains(e.target))) {
+        this.downloadMenuOpen = false;
+      }
+    },
     // markdown → HTML（惰性渲染，切到 HTML tab 才转换）
     renderHtml() {
       const md = this.currentArticle;
       if (!md || this.htmlRenderedFor === md) return;
-      this.htmlContent = DOMPurify.sanitize(marked.parse(md));
+      // 先保护 LaTeX 数学段（及围栏代码块），再交给 marked，转换后还原，
+      // 避免 Markdown 把公式里的 _ 当成强调语法破坏 $$...$$ 等数学标记
+      const { protectedMd, segments } = protectMathSegments(fixEmphasisSpacing(md));
+      const sanitized = DOMPurify.sanitize(marked.parse(protectedMd));
+      this.htmlContent = restoreMathSegments(sanitized, segments);
       this.htmlRenderedFor = md;
     },
     // 渲染容器内的 Mermaid 代码块为图表；懒加载脚本，失败时保留原文代码块
@@ -310,6 +399,9 @@ export default {
       if (this.readerOpen) {
         document.body.classList.remove("reader-open");
         document.removeEventListener("keydown", this.onReaderKeydown);
+      }
+      if (this.downloadMenuOpen) {
+        document.removeEventListener("click", this.onDocClick);
       }
     },
     async retry() {
@@ -469,28 +561,21 @@ export default {
           @click="switchTab(t.key)"
         >{{ t.label }}</button>
       </div>
-      <div v-if="activeTab === 'article' && job.status === 'done' && currentArticle">
-        <div class="job-tab-toolbar">
-          <button class="ghost job-copy-article" @click="copyArticle">复制文章</button>
-          <button class="ghost" @click="download('md')">下载 MD</button>
-          <button class="ghost" @click="download('html')">下载 HTML</button>
-          <button class="ghost" @click="download('pdf')">下载 PDF</button>
-        </div>
-        <div class="job-page-picker" v-if="isMultiPage">
-          <select
-            class="job-page-select" :value="activePage"
-            @change="switchPage(Number($event.target.value))"
-            :title="'共 ' + job.page_articles.length + ' 篇，选择要查看的篇目'"
-          >
-            <option v-for="(p, i) in job.page_articles" :key="i" :value="i">第 {{ i + 1 }} 篇 · {{ pageTitle(p) }}</option>
-          </select>
-          <span class="job-page-count">{{ activePage + 1 }} / {{ job.page_articles.length }}</span>
-        </div>
-        <div class="job-detail-article" v-text="currentArticle"></div>
-      </div>
       <div v-if="activeTab === 'html' && job.status === 'done' && currentArticle">
-        <div class="job-tab-toolbar">
+        <div class="job-tab-toolbar" @click="closeDownloadMenu">
           <button class="ghost job-copy-html" @click="copyHtml">复制 HTML</button>
+          <div class="job-download-menu" @click.stop>
+            <button class="ghost job-download-main" @click="download('html')" title="下载 HTML">⬇ 下载 HTML</button>
+            <button
+              class="ghost job-download-toggle" @click="toggleDownloadMenu"
+              title="选择下载格式" :aria-expanded="downloadMenuOpen"
+            >▾</button>
+            <div class="job-download-items" v-if="downloadMenuOpen">
+              <button class="ghost" @click="downloadChoice('md')">下载 MD</button>
+              <button class="ghost" @click="downloadChoice('html')">下载 HTML</button>
+              <button class="ghost" @click="downloadChoice('pdf')">下载 PDF</button>
+            </div>
+          </div>
           <button class="ghost" @click="openReader">📖 阅读模式</button>
         </div>
         <div class="job-page-picker" v-if="isMultiPage">

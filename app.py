@@ -978,6 +978,24 @@ _TABLE_BOUNDARY_RE = re.compile(r"\|\s*\|")
 _LIST_ITEM_RE = re.compile(r"\s*([*+-]|\d{1,2}[.、])\s")
 _INLINE_BULLET_RE = re.compile(r"(?<=[。！？；：])\s+([*+-])\s+")
 _INLINE_NUMBERED_RE = re.compile(r"(?<=[。！？；：])\s+(\d{1,2})\.\s+")
+# 成对的 ** 加粗标记（内部不含 *，避免误伤 ***加粗斜体*** 与嵌套强调）
+_EMPH_SPACE_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+
+
+def _fix_emphasis_spacing(line: str) -> str:
+    """剥离 ** 加粗标记内层首尾的多余空格，如 "** 文字**" → "**文字**"。
+
+    CommonMark 规定 ** 后不能紧跟空格才算加粗开始，模型偶尔会在 ** 与
+    文字之间多打空格，导致标记失效、** 裸露显示。只修首尾空白，内部
+    空格（如 "**能力 圈**"）保持不变。
+    """
+
+    def _replace(m: re.Match) -> str:
+        inner = m.group(1)
+        stripped = inner.strip()
+        return f"**{stripped}**" if stripped != inner else m.group(0)
+
+    return _EMPH_SPACE_RE.sub(_replace, line)
 
 
 def _repair_squashed_table(line: str) -> list[str]:
@@ -1043,7 +1061,7 @@ def repair_article_markdown(article: str) -> str:
                 )
                 if prev_is_block != cur_is_block:
                     out.append("")
-            out.append(piece)
+            out.append(_fix_emphasis_spacing(piece))
     return "\n".join(out)
 
 
@@ -1585,6 +1603,8 @@ def job_download_files(job: dict[str, Any], fmt: str = "md") -> list[tuple[str, 
     payloads: list[tuple[str, bytes]] = []
     with tempfile.TemporaryDirectory(prefix="dl-") as tmp:
         for out_dir_item, art_item in items:
+            # 输出前统一过一遍格式修复（幂等），旧任务也能得到干净的下载内容
+            art_item = repair_article_markdown(art_item)
             stem = Path(out_dir_item).name or "article"
             if fmt == "md":
                 payloads.append((f"{stem}.md", art_item.encode("utf-8")))
@@ -1622,6 +1642,7 @@ def upload_job_to_drive(job_id: str, user_id: str) -> dict[str, Any]:
 
     links: list[str] = []
     for out_dir_item, art_item in _job_article_items(job):
+        art_item = repair_article_markdown(art_item)
         out_dir = Path(out_dir_item)
         if not out_dir.name:
             raise RuntimeError("任务缺少输出目录信息，无法上传")
@@ -1629,13 +1650,11 @@ def upload_job_to_drive(job_id: str, user_id: str) -> dict[str, Any]:
         stem = out_dir.name
         if gdrive_format == "html":
             file_path = out_dir / f"{stem}.html"
-            if not file_path.exists():
-                write_article_html(art_item, file_path)
+            write_article_html(art_item, file_path)
             mime_type = "text/html"
         else:
             file_path = out_dir / f"{stem}.pdf"
-            if not file_path.exists():
-                write_article_pdf(art_item, file_path)
+            write_article_pdf(art_item, file_path)
             mime_type = "application/pdf"
 
         target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, user_id)
@@ -1669,11 +1688,16 @@ def write_article_html(article: str, path: Path) -> None:
         raise RuntimeError("缺少 markdown 依赖。请执行：pip install markdown")
 
     has_mermaid = "```mermaid" in article
+    # 先保护数学公式（$$...$$、$...$、\[...\]、\(...\)）与围栏代码块，
+    # 避免 Markdown 把公式中的下划线（\mathcal{L}_{aux} 的 _）当成强调语法
+    # 转成 <em>，破坏公式并让 KaTeX 无法匹配分隔符；转换后再还原。
+    protected, math_segments = _protect_math_segments(article)
     html_body = md_lib.markdown(
-        article,
+        protected,
         output_format="xhtml",
         extensions=["tables", "fenced_code"],
     )
+    html_body = _restore_math_segments(html_body, math_segments)
     title = ""
     for line in article.splitlines():
         line = line.strip()
@@ -1701,7 +1725,9 @@ def write_article_html(article: str, path: Path) -> None:
 <script defer src="https://cdn.staticfile.org/KaTeX/0.16.11/contrib/auto-render.min.js"
         onload="renderMathInElement(document.body, {{delimiters: [
             {{left: '\$\$', right: '\$\$', display: true}},
+            {{left: '\\\\[', right: '\\\\]', display: true}},
             {{left: '\$', right: '\$', display: false}},
+            {{left: '\\\\\\(', right: '\\\\\\)', display: false}},
         ], ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']}});"></script>
 {mermaid_assets}
 <style>
@@ -1742,6 +1768,13 @@ def write_article_html(article: str, path: Path) -> None:
   }}
   pre code {{ background: none; padding: 0; }}
   pre:has(> code.language-mermaid) {{ background: #fff; text-align: center; }}
+  /* Mermaid 标签在 foreignObject 内继承了文章行高（body 1.85 / pre 1.6），
+     比 Mermaid 测量出的标签框更高，多行标签第二行会被裁掉；
+     重置标签行高并允许溢出兜底，保证两行文字完整显示。 */
+  pre:has(> code.language-mermaid) svg foreignObject {{ overflow: visible; }}
+  pre:has(> code.language-mermaid) svg foreignObject div,
+  pre:has(> code.language-mermaid) svg foreignObject span,
+  pre:has(> code.language-mermaid) svg foreignObject p {{ line-height: 1.3; }}
   hr {{ border: none; border-top: 1px solid #eee; margin: 2em 0; }}
   table {{ width: 100%; border-collapse: collapse; margin: 1em 0; font-size: .9em; }}
   th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
@@ -1958,6 +1991,13 @@ def _build_pdf_html(article: str, md_lib) -> str:
   }}
   pre code {{ background: none; padding: 0; }}
   pre:has(> code.language-mermaid) {{ background: #fff; text-align: center; }}
+  /* Mermaid 标签在 foreignObject 内继承了文章行高（body 1.8 / pre 1.5），
+     与 Mermaid 测量标签框用的行高不一致时多行标签第二行会被裁掉；
+     重置标签行高并允许溢出兜底。 */
+  pre:has(> code.language-mermaid) svg foreignObject {{ overflow: visible; }}
+  pre:has(> code.language-mermaid) svg foreignObject div,
+  pre:has(> code.language-mermaid) svg foreignObject span,
+  pre:has(> code.language-mermaid) svg foreignObject p {{ line-height: 1.3; }}
   hr {{ border: none; border-top: 1px solid #ccc; margin: 1.5em 0; }}
   table {{ width: 100%; border-collapse: collapse; margin: .8em 0; font-size: .85em; }}
   th, td {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; }}
