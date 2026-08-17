@@ -85,13 +85,20 @@ const BADGE_MAP = {
 // 模型偶尔会在 ** 与文字之间多打空格（如 "** 文字**"），CommonMark 规定 ** 后
 // 不能紧跟空格才算加粗开始，导致标记失效、** 裸露。渲染前剥离内层首尾空白，
 // 与后端 app.py 的 _fix_emphasis_spacing 保持一致。只修首尾空白，内部空格不动。
+// 另：** 紧贴中文/ASCII 引号时（**“X”**），CommonMark 不认该分隔符（* 后紧跟
+// 标点且前面非空白/标点 → 不能作加粗起点），把引号移到 ** 外侧：**“X”** → “**X**”。
 const EMPH_SPACE_RE = /\*\*([^*\n]+?)\*\*/g;
+const EMPH_QUOTE_RE = /\*\*([“‘'"「])([^*\n]+?)([”’'"」])\*\*/g;
 
 function fixEmphasisSpacing(md) {
-  return md.replace(EMPH_SPACE_RE, (whole, inner) => {
+  let out = md.replace(EMPH_SPACE_RE, (whole, inner) => {
     const stripped = inner.trim();
     return stripped !== inner ? `**${stripped}**` : whole;
   });
+  return out.replace(
+    EMPH_QUOTE_RE,
+    (whole, open, inner, close) => `${open}**${inner}**${close}`,
+  );
 }
 
 // ── LaTeX 数学公式保护 ─────────────────────────────
@@ -168,6 +175,8 @@ export default {
       htmlContent: null, // HTML 渲染结果（懒渲染缓存）
       htmlRenderedFor: null, // 已渲染的文章内容，列表轮询内容不变时不重渲
       readerOpen: false, // 阅读模式弹窗是否打开
+      readerProgress: 0, // 阅读进度 0-100（按阅读区滚动条位置计算）
+      readerObserver: null, // 阅读区尺寸变化监听（刷新进度）
       downloadMenuOpen: false, // 下载下拉菜单是否展开
     };
   },
@@ -245,6 +254,10 @@ export default {
       // 展开时监听文档点击，点击菜单外部收起
       if (open) document.addEventListener("click", this.onDocClick);
       else document.removeEventListener("click", this.onDocClick);
+    },
+    // 阅读弹窗打开时，文章内容重渲（任务更新/切篇）后按新高度刷新进度
+    htmlContent() {
+      if (this.readerOpen) this.$nextTick(() => this.updateReaderProgress());
     },
   },
   methods: {
@@ -377,28 +390,72 @@ export default {
       this.htmlRenderedFor = null;
       if (this.activeTab === "html" || this.readerOpen) this.renderHtml();
       this.renderRichAfterTick();
+      // 阅读弹窗里切篇：回到顶部并从 0 重新计进度
+      if (this.readerOpen) {
+        this.readerProgress = 0;
+        this.$nextTick(() => {
+          const body = this.$refs.readerBody;
+          if (body) body.scrollTop = 0;
+          this.updateReaderProgress();
+        });
+      }
     },
     // 打开阅读模式弹窗：惰性渲染当前文章为 HTML，锁定页面滚动，监听 Esc 关闭
     openReader() {
       this.renderHtml();
+      this.readerProgress = 0;
       this.readerOpen = true;
       document.body.classList.add("reader-open");
       document.addEventListener("keydown", this.onReaderKeydown);
       this.renderRichAfterTick();
+      // 弹窗挂载后：初始化进度，并监听阅读区尺寸变化
+      // （KaTeX/Mermaid 渲染、任务内容更新、切篇都会改变高度，据此刷新进度）
+      this.$nextTick(() => {
+        this.updateReaderProgress();
+        const body = this.$refs.readerBody;
+        if (body && typeof ResizeObserver !== "undefined") {
+          this.readerObserver = new ResizeObserver(() => this.updateReaderProgress());
+          this.readerObserver.observe(body);
+        }
+      });
     },
     closeReader() {
       this.readerOpen = false;
       document.body.classList.remove("reader-open");
       document.removeEventListener("keydown", this.onReaderKeydown);
+      if (this.readerObserver) {
+        this.readerObserver.disconnect();
+        this.readerObserver = null;
+      }
     },
     onReaderKeydown(e) {
       if (e.key === "Escape") this.closeReader();
+    },
+    // 按阅读区滚动条位置计算阅读进度（0-100）
+    updateReaderProgress() {
+      const el = this.$refs.readerBody;
+      if (!el) return;
+      const max = el.scrollHeight - el.clientHeight;
+      if (max <= 0) {
+        // 内容不满一屏，全部可见即视为读完
+        this.readerProgress = 100;
+      } else {
+        const pct = Math.round((el.scrollTop / max) * 100);
+        this.readerProgress = Math.min(100, Math.max(0, pct));
+      }
+    },
+    onReaderScroll() {
+      this.updateReaderProgress();
     },
     // 组件卸载时清理弹窗残留的监听与滚动锁
     beforeUnmount() {
       if (this.readerOpen) {
         document.body.classList.remove("reader-open");
         document.removeEventListener("keydown", this.onReaderKeydown);
+      }
+      if (this.readerObserver) {
+        this.readerObserver.disconnect();
+        this.readerObserver = null;
       }
       if (this.downloadMenuOpen) {
         document.removeEventListener("click", this.onDocClick);
@@ -604,29 +661,40 @@ export default {
       </div>
     </div>
   </div>
-  <!-- 阅读模式弹窗：全屏遮罩 + 阅读排版的文章视图 -->
-  <div v-if="readerOpen" class="reader-modal" @click.stop.self="closeReader">
-    <div class="reader-modal-panel" role="dialog" aria-modal="true" aria-label="阅读模式">
-      <div class="reader-modal-head">
-        <div class="reader-modal-title" :title="readerTitle">{{ readerTitle }}</div>
-        <div class="reader-modal-tools">
-          <select
-            v-if="isMultiPage"
-            class="job-page-select" :value="activePage"
-            @change="switchPage(Number($event.target.value))"
-            :title="'共 ' + job.page_articles.length + ' 篇，选择要查看的篇目'"
-          >
-            <option v-for="(p, i) in job.page_articles" :key="i" :value="i">第 {{ i + 1 }} 篇 · {{ pageTitle(p) }}</option>
-          </select>
-          <button class="ghost" @click="copyArticle($event)">复制文章</button>
-          <button class="ghost" @click="download('md')">下载 MD</button>
-          <button class="reader-modal-close" @click="closeReader" title="关闭 (Esc)">✕</button>
+  <!-- 阅读模式弹窗：Teleport 到 body 渲染，避免继承任务条目的 cursor/字号/层叠上下文等样式 -->
+  <Teleport to="body">
+    <div v-if="readerOpen" class="reader-modal" @click.stop.self="closeReader">
+      <div class="reader-modal-panel" role="dialog" aria-modal="true" aria-label="阅读模式">
+        <!-- 阅读进度条：顶部细条，按阅读区滚动条位置填充 -->
+        <div
+          class="reader-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+          :aria-valuenow="readerProgress" :title="'阅读进度 ' + readerProgress + '%'"
+        >
+          <div class="reader-progress-fill" :style="{ width: readerProgress + '%' }"></div>
         </div>
-      </div>
-      <div class="reader-modal-body" ref="readerBody">
-        <div class="reader-prose job-detail-html" v-html="htmlContent"></div>
+        <div class="reader-modal-head">
+          <div class="reader-modal-title" :title="readerTitle">{{ readerTitle }}</div>
+          <div class="reader-modal-tools">
+            <select
+              v-if="isMultiPage"
+              class="job-page-select" :value="activePage"
+              @change="switchPage(Number($event.target.value))"
+              :title="'共 ' + job.page_articles.length + ' 篇，选择要查看的篇目'"
+            >
+              <option v-for="(p, i) in job.page_articles" :key="i" :value="i">第 {{ i + 1 }} 篇 · {{ pageTitle(p) }}</option>
+            </select>
+            <button class="ghost" @click="copyArticle($event)">复制文章</button>
+            <button class="ghost" @click="download('md')">下载 MD</button>
+            <button class="reader-modal-close" @click="closeReader" title="关闭 (Esc)">✕</button>
+          </div>
+        </div>
+        <div class="reader-modal-body" ref="readerBody" @scroll="onReaderScroll">
+          <div class="reader-prose job-detail-html" v-html="htmlContent"></div>
+        </div>
+        <!-- 阅读进度百分比：固定在阅读区右下角 -->
+        <div class="reader-progress-pill" :class="{ done: readerProgress >= 100 }">{{ readerProgress }}%</div>
       </div>
     </div>
-  </div>
+  </Teleport>
 </div>`,
 };

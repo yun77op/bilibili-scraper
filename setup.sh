@@ -160,4 +160,70 @@ else
 fi
 
 echo ""
+echo "Downloading Marked (for Markdown rendering)..."
+MARKED_VERSION="${MARKED_VERSION:-15.0.6}"
+MARKED_DIR="$SCRIPT_DIR/static/vendor/marked"
+MARKED_FILE="$MARKED_DIR/marked.esm.min.js"
+
+if [ -f "$MARKED_FILE" ]; then
+    echo "Marked assets already exist: $MARKED_DIR"
+else
+    mkdir -p "$MARKED_DIR"
+    DOWNLOADED=""
+    for url in \
+        "https://registry.npmmirror.com/marked/-/marked-${MARKED_VERSION}.tgz" \
+        "https://registry.npmjs.org/marked/-/marked-${MARKED_VERSION}.tgz"; do
+        echo "Trying $url"
+        TMP_MARKED="$(mktemp -d)"
+        if curl -fsSL --connect-timeout 8 --max-time 180 "$url" -o "$TMP_MARKED/marked.tgz" \
+            && tar -xzf "$TMP_MARKED/marked.tgz" -C "$TMP_MARKED" \
+            && cp "$TMP_MARKED/package/lib/marked.esm.js" "$MARKED_FILE"; then
+            DOWNLOADED="yes"
+            rm -rf "$TMP_MARKED"
+            break
+        fi
+        rm -rf "$TMP_MARKED"
+    done
+    if [ -z "$DOWNLOADED" ]; then
+        echo "ERROR: failed to download Marked ${MARKED_VERSION} from all mirrors; web UI will not work."
+        exit 1
+    else
+        echo "Marked ${MARKED_VERSION} installed to $MARKED_DIR"
+    fi
+fi
+
+echo ""
+echo "Downloading DOMPurify (for sanitizing rendered HTML)..."
+DOMPURIFY_VERSION="${DOMPURIFY_VERSION:-3.2.4}"
+DOMPURIFY_DIR="$SCRIPT_DIR/static/vendor/dompurify"
+DOMPURIFY_FILE="$DOMPURIFY_DIR/purify.es.mjs"
+
+if [ -f "$DOMPURIFY_FILE" ]; then
+    echo "DOMPurify assets already exist: $DOMPURIFY_DIR"
+else
+    mkdir -p "$DOMPURIFY_DIR"
+    DOWNLOADED=""
+    for url in \
+        "https://registry.npmmirror.com/dompurify/-/dompurify-${DOMPURIFY_VERSION}.tgz" \
+        "https://registry.npmjs.org/dompurify/-/dompurify-${DOMPURIFY_VERSION}.tgz"; do
+        echo "Trying $url"
+        TMP_DOMPURIFY="$(mktemp -d)"
+        if curl -fsSL --connect-timeout 8 --max-time 180 "$url" -o "$TMP_DOMPURIFY/dompurify.tgz" \
+            && tar -xzf "$TMP_DOMPURIFY/dompurify.tgz" -C "$TMP_DOMPURIFY" \
+            && cp "$TMP_DOMPURIFY/package/dist/purify.es.mjs" "$DOMPURIFY_FILE"; then
+            DOWNLOADED="yes"
+            rm -rf "$TMP_DOMPURIFY"
+            break
+        fi
+        rm -rf "$TMP_DOMPURIFY"
+    done
+    if [ -z "$DOWNLOADED" ]; then
+        echo "ERROR: failed to download DOMPurify ${DOMPURIFY_VERSION} from all mirrors; web UI will not work."
+        exit 1
+    else
+        echo "DOMPurify ${DOMPURIFY_VERSION} installed to $DOMPURIFY_DIR"
+    fi
+fi
+
+echo ""
 echo "Done."

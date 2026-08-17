@@ -980,14 +980,18 @@ _INLINE_BULLET_RE = re.compile(r"(?<=[。！？；：])\s+([*+-])\s+")
 _INLINE_NUMBERED_RE = re.compile(r"(?<=[。！？；：])\s+(\d{1,2})\.\s+")
 # 成对的 ** 加粗标记（内部不含 *，避免误伤 ***加粗斜体*** 与嵌套强调）
 _EMPH_SPACE_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+# 加粗标记紧贴引号（**“X”**）：CommonMark 规定 * 后紧跟标点且前面不是
+# 空白/标点时不能作为加粗起始，于是星号按字面输出。把引号移到 ** 外侧：
+# **“X”** → “**X**”，两种渲染器都能识别，输出文本不变。
+_EMPH_QUOTE_RE = re.compile(r"\*\*([“‘'\u0022\u300c])([^*\n]+?)([”’'\u0022\u300d])\*\*")
 
 
 def _fix_emphasis_spacing(line: str) -> str:
-    """剥离 ** 加粗标记内层首尾的多余空格，如 "** 文字**" → "**文字**"。
+    """修复加粗标记格式：剥离内层首尾多余空格，并把紧贴引号的 ** 移到引号外。
 
     CommonMark 规定 ** 后不能紧跟空格才算加粗开始，模型偶尔会在 ** 与
     文字之间多打空格，导致标记失效、** 裸露显示。只修首尾空白，内部
-    空格（如 "**能力 圈**"）保持不变。
+    空格（如 "**能力 圈**"）保持不变。引号紧贴的情况见 _EMPH_QUOTE_RE。
     """
 
     def _replace(m: re.Match) -> str:
@@ -995,7 +999,10 @@ def _fix_emphasis_spacing(line: str) -> str:
         stripped = inner.strip()
         return f"**{stripped}**" if stripped != inner else m.group(0)
 
-    return _EMPH_SPACE_RE.sub(_replace, line)
+    line = _EMPH_SPACE_RE.sub(_replace, line)
+    return _EMPH_QUOTE_RE.sub(
+        lambda m: f"{m.group(1)}**{m.group(2)}**{m.group(3)}", line
+    )
 
 
 def _repair_squashed_table(line: str) -> list[str]:

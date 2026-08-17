@@ -38,6 +38,13 @@ echo "Python: $($PYTHON --version)"
 mkdir -p "$PID_DIR"
 mkdir -p "$LOG_DIR"
 
+# 3.5 检查 .env.local 配置文件
+if [ ! -f "$SCRIPT_DIR/.env.local" ]; then
+    echo "ERROR: 缺少配置文件 $SCRIPT_DIR/.env.local" >&2
+    echo "      请先创建: cp $SCRIPT_DIR/.env.example $SCRIPT_DIR/.env.local" >&2
+    exit 1
+fi
+
 # 4. 启动 HTTP 服务
 echo "[2/3] 启动 HTTP 服务（端口 ${PORT}）..."
 cd "$SCRIPT_DIR"

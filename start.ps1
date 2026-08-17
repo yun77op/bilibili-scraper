@@ -35,6 +35,13 @@ Write-Host "Python: $PythonPath" -ForegroundColor Gray
 New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 
+# 3.5 Check .env.local config file
+if (-not (Test-Path (Join-Path $scriptDir ".env.local"))) {
+    Write-Host "ERROR: 缺少配置文件 $(Join-Path $scriptDir '.env.local')" -ForegroundColor Red
+    Write-Host "      请先创建: Copy-Item .env.example .env.local" -ForegroundColor Red
+    exit 1
+}
+
 # 4. Start server
 Write-Host "[2/3] 启动 HTTP 服务（端口 $Port）..." -ForegroundColor Gray
 $serverProcess = Start-Process -FilePath $PythonPath `

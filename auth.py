@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import secrets
+import sys
 import time
 from typing import Any, Callable
 
@@ -34,7 +35,17 @@ MIN_PASSWORD_LEN = 6
 # ---------------------------------------------------------------------------
 
 def ensure_secret_key() -> str:
-    """Return the Flask SECRET_KEY, generating and persisting one if missing."""
+    """Return the Flask SECRET_KEY.  Requires ``.env.local`` to exist."""
+    if not ENV_FILE.exists():
+        print(
+            f"ERROR: 缺少配置文件 {ENV_FILE}",
+            file=sys.stderr,
+        )
+        print(
+            f"      请先创建: cp {ENV_FILE.name}.example {ENV_FILE.name}，并填写配置后重新启动",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.strip().startswith("FLASK_SECRET_KEY="):
             return line.split("=", 1)[1].strip().strip('"').strip("'")
@@ -49,7 +60,9 @@ def ensure_secret_key() -> str:
 # ---------------------------------------------------------------------------
 
 def hash_password(password: str) -> str:
-    return _generate_hash(password)
+    # Werkzeug 默认的 scrypt 需要 hashlib.scrypt（LibreSSL 构建的 Python 没有），
+    # 统一用始终可用的 pbkdf2:sha256
+    return _generate_hash(password, method="pbkdf2:sha256")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
