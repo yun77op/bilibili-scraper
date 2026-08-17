@@ -16,5 +16,6 @@ youtube-cookies.txt
 jobs.db
 jobs.db-wal
 jobs.db-shm
+kb_index.json
 .pids/
 .DS_Store

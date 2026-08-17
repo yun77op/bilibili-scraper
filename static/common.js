@@ -25,7 +25,8 @@ export const Navbar = {
   template: `
     <nav class="main-nav">
       <div class="nav-links">
-        <a class="nav-link" :class="{ active: current === 'index' }" href="/">转换</a>
+        <a class="nav-link" :class="{ active: current === 'index' }" href="/app">转换</a>
+        <a class="nav-link" :class="{ active: current === 'kb' }" href="/kb">知识库</a>
         <a class="nav-link" :class="{ active: current === 'settings' }" href="/settings">设置</a>
       </div>
       <div class="nav-user">

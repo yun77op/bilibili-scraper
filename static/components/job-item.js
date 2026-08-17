@@ -1,77 +1,7 @@
 // 任务条目组件：状态徽章、展开详情（HTML/转写稿/日志 tab）、操作按钮
 // 展开状态与 tab 是组件内部状态，列表刷新时 Vue 按 :key 保留实例，不重建
 import { api } from "/static/common.js";
-import { marked } from "/static/vendor/marked/marked.esm.min.js";
-import DOMPurify from "/static/vendor/dompurify/purify.es.mjs";
-
-// markdown 渲染后的链接默认新窗口打开
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName === "A") {
-    node.setAttribute("target", "_blank");
-    node.setAttribute("rel", "noopener noreferrer");
-  }
-});
-
-// ── Mermaid 图表懒加载 ─────────────────────────────
-// 文章含 ```mermaid 代码块时才动态加载脚本，避免每次打开页面都拉取 3MB 文件
-let mermaidPromise = null;
-function loadMermaid() {
-  if (!mermaidPromise) {
-    mermaidPromise = new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = "/static/vendor/mermaid/mermaid.min.js";
-      s.onload = () => {
-        try {
-          // 与文档/离线 HTML 输出保持一致的初始化配置
-          window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true });
-          resolve(window.mermaid);
-        } catch (err) {
-          mermaidPromise = null;
-          reject(err);
-        }
-      };
-      s.onerror = () => {
-        mermaidPromise = null;
-        reject(new Error("Mermaid 加载失败"));
-      };
-      document.head.appendChild(s);
-    });
-  }
-  return mermaidPromise;
-}
-
-// ── KaTeX 数学公式懒加载 ───────────────────────────
-// 文章含 $...$ / $$...$$ 数学标记时才加载样式与脚本（auto-render 依赖 katex 全局）
-let katexPromise = null;
-function loadKatex() {
-  if (!katexPromise) {
-    katexPromise = new Promise((resolve, reject) => {
-      // 样式（含字体）先行，避免公式先以未渲染文本闪现
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      link.href = "/static/vendor/katex/katex.min.css";
-      document.head.appendChild(link);
-      const s1 = document.createElement("script");
-      s1.src = "/static/vendor/katex/katex.min.js";
-      s1.onload = () => {
-        const s2 = document.createElement("script");
-        s2.src = "/static/vendor/katex/auto-render.min.js";
-        s2.onload = () => resolve(window.renderMathInElement);
-        s2.onerror = () => {
-          katexPromise = null;
-          reject(new Error("KaTeX auto-render 加载失败"));
-        };
-        document.head.appendChild(s2);
-      };
-      s1.onerror = () => {
-        katexPromise = null;
-        reject(new Error("KaTeX 加载失败"));
-      };
-      document.head.appendChild(s1);
-    });
-  }
-  return katexPromise;
-}
+import { sanitizeMarkdown, renderRich } from "/static/markdown.js";
 
 const BADGE_MAP = {
   queued: ["排队中", "badge-queued"],
@@ -80,70 +10,6 @@ const BADGE_MAP = {
   error: ["失败", "badge-error"],
   cancelled: ["已取消", "badge-cancelled"],
 };
-
-// ── Markdown 强调标记修复 ─────────────────────────
-// 模型偶尔会在 ** 与文字之间多打空格（如 "** 文字**"），CommonMark 规定 ** 后
-// 不能紧跟空格才算加粗开始，导致标记失效、** 裸露。渲染前剥离内层首尾空白，
-// 与后端 app.py 的 _fix_emphasis_spacing 保持一致。只修首尾空白，内部空格不动。
-// 另：** 紧贴中文/ASCII 引号时（**“X”**），CommonMark 不认该分隔符（* 后紧跟
-// 标点且前面非空白/标点 → 不能作加粗起点），把引号移到 ** 外侧：**“X”** → “**X**”。
-const EMPH_SPACE_RE = /\*\*([^*\n]+?)\*\*/g;
-const EMPH_QUOTE_RE = /\*\*([“‘'"「])([^*\n]+?)([”’'"」])\*\*/g;
-
-function fixEmphasisSpacing(md) {
-  let out = md.replace(EMPH_SPACE_RE, (whole, inner) => {
-    const stripped = inner.trim();
-    return stripped !== inner ? `**${stripped}**` : whole;
-  });
-  return out.replace(
-    EMPH_QUOTE_RE,
-    (whole, open, inner, close) => `${open}**${inner}**${close}`,
-  );
-}
-
-// ── LaTeX 数学公式保护 ─────────────────────────────
-// Markdown 会把公式里的下划线（\mathcal{L}_{aux} 的 _）当成强调语法转成 <em>，
-// 破坏公式并让 KaTeX 无法匹配 $$...$$ 等分隔符。转换前先把数学段（及围栏代码块）
-// 替换为占位符，转换后再还原，与后端 app.py 的 _protect_math_segments 保持一致。
-const MATH_PLACEHOLDER = "KATEXMATHSEG{}Z";
-const MATH_SEGMENT_RE = /```[\s\S]*?```|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
-
-function protectMathSegments(md) {
-  const segments = [];
-  const protectedMd = md.replace(MATH_SEGMENT_RE, (m) => {
-    segments.push(m);
-    return MATH_PLACEHOLDER.replace("{}", segments.length - 1);
-  });
-  return { protectedMd, segments };
-}
-
-function escapeHtmlText(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function restoreMathSegments(html, segments) {
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    const placeholder = MATH_PLACEHOLDER.replace("{}", i);
-    if (seg.startsWith("```")) {
-      // 围栏代码块：还原为 <pre><code class="language-...">（mermaid 依赖该结构）
-      let body = seg.slice(3);
-      const firstNl = body.indexOf("\n");
-      const info = firstNl !== -1 ? body.slice(0, firstNl).trim() : "";
-      body = firstNl !== -1 ? body.slice(firstNl + 1) : "";
-      if (body.replace(/\n+$/, "").endsWith("```")) {
-        body = body.replace(/\n+$/, "").slice(0, -3);
-      }
-      const langCls = info ? ` class="language-${info}"` : "";
-      const codeHtml = `<pre><code${langCls}>${escapeHtmlText(body.trim())}</code></pre>`;
-      const wrapped = `<p>${placeholder}</p>`;
-      html = html.includes(wrapped) ? html.replace(wrapped, codeHtml) : html.split(placeholder).join(codeHtml);
-    } else {
-      html = html.split(placeholder).join(escapeHtmlText(seg));
-    }
-  }
-  return html;
-}
 
 function truncateUrl(url) {
   if (!url) return "";
@@ -300,80 +166,17 @@ export default {
     renderHtml() {
       const md = this.currentArticle;
       if (!md || this.htmlRenderedFor === md) return;
-      // 先保护 LaTeX 数学段（及围栏代码块），再交给 marked，转换后还原，
-      // 避免 Markdown 把公式里的 _ 当成强调语法破坏 $$...$$ 等数学标记
-      const { protectedMd, segments } = protectMathSegments(fixEmphasisSpacing(md));
-      const sanitized = DOMPurify.sanitize(marked.parse(protectedMd));
-      this.htmlContent = restoreMathSegments(sanitized, segments);
+      this.htmlContent = sanitizeMarkdown(md);
       this.htmlRenderedFor = md;
-    },
-    // 渲染容器内的 Mermaid 代码块为图表；懒加载脚本，失败时保留原文代码块
-    async renderMermaid(container) {
-      if (!container) return;
-      const blocks = container.querySelectorAll("pre > code.language-mermaid");
-      if (!blocks.length) return;
-      let mermaid;
-      try {
-        mermaid = await loadMermaid();
-      } catch {
-        return; // 脚本加载失败：保留代码块原文
-      }
-      for (const code of blocks) {
-        const pre = code.parentElement;
-        const text = code.textContent.trim();
-        if (!pre || !text) continue;
-        const id = "mermaid-" + Math.random().toString(36).slice(2, 10);
-        try {
-          const { svg } = await mermaid.render(id, text);
-          const wrap = document.createElement("div");
-          wrap.className = "mermaid-block";
-          wrap.innerHTML = svg;
-          pre.replaceWith(wrap);
-        } catch {
-          // 语法错误等：保留原文代码块
-        } finally {
-          // mermaid.render 会在 body 挂临时测量节点（id 前缀 d），用后清理
-          const tmp = document.getElementById("d" + id);
-          if (tmp) tmp.remove();
-        }
-      }
-    },
-    // 渲染容器内的 LaTeX 数学公式（$...$ 行内、$$...$$ 独立行）；懒加载脚本，失败保留原文
-    async renderKatex(container) {
-      if (!container) return;
-      const html = container.innerHTML;
-      if (!html || !html.includes("$")) return; // 无数学标记直接跳过
-      let renderMathInElement;
-      try {
-        renderMathInElement = await loadKatex();
-      } catch {
-        return; // 脚本加载失败：保留原文
-      }
-      try {
-        // 与后端文档/离线 HTML 保持一致的分隔符；pre/code 里的内容（含 mermaid）不参与
-        renderMathInElement(container, {
-          delimiters: [
-            { left: "$$", right: "$$", display: true },
-            { left: "\\[", right: "\\]", display: true },
-            { left: "$", right: "$", display: false },
-            { left: "\\(", right: "\\)", display: false },
-          ],
-          ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
-        });
-      } catch {
-        // 个别公式语法错误：保留原文
-      }
     },
     // DOM 更新后，对可见的 HTML 内容依次渲染 KaTeX 与 Mermaid（HTML tab 与阅读弹窗）
     renderRichAfterTick() {
       this.$nextTick(() => {
         if (this.activeTab === "html") {
-          this.renderKatex(this.$refs.htmlPane);
-          this.renderMermaid(this.$refs.htmlPane);
+          renderRich(this.$refs.htmlPane);
         }
         if (this.readerOpen) {
-          this.renderKatex(this.$refs.readerBody);
-          this.renderMermaid(this.$refs.readerBody);
+          renderRich(this.$refs.readerBody);
         }
       });
     },

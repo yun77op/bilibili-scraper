@@ -311,15 +311,25 @@ def download_audio(url: str, out_dir: Path, job: Job, view_data: dict | None = N
     if play_data is None:
         raise RuntimeError(f"无法获取播放地址：{last_error}")
 
-    audio_stream = pick_audio_stream(play_data)
-    audio_url = audio_stream.get("baseUrl") or audio_stream.get("base_url")
+    audio_stream, kind = pick_play_stream(
+        play_data,
+        cookie_configured=bool(headers.get("Cookie")),
+        exclusive=upower_exclusive(view_data),
+    )
+    audio_url = stream_url(audio_stream)
     if not audio_url:
-        raise RuntimeError("播放地址接口没有返回音频 URL。")
+        raise RuntimeError("播放地址接口没有返回可下载的音频/视频 URL。")
 
-    extension = audio_extension(audio_stream, audio_url)
+    if kind == "durl":
+        if upower_exclusive(view_data):
+            job.log("该视频为充电专属（专属视频档），未开通包月充电时只能获取低清整段视频流，将下载后提取音频", 25)
+        else:
+            job.log("未登录时接口只返回整段视频流（MP4/FLV），将下载后提取音频，音质可能低于 DASH", 25)
+    extension = audio_extension(audio_stream, audio_url, kind)
     audio_path = out_dir / f"{sanitize_filename(title)}-{bvid}.{extension}"
     job.log("正在下载音频文件", 35)
-    download_file(audio_url, audio_path, headers, job)
+    download_file(audio_url, audio_path, headers, job,
+                  backup_urls=audio_stream.get("backup_url") or audio_stream.get("backupUrl") or [])
     return audio_path
 
 
@@ -708,14 +718,67 @@ def http_get(url: str, headers: dict[str, str], timeout: int = 30) -> bytes:
         raise RuntimeError(f"网络请求失败：{exc.reason}") from exc
 
 
-def pick_audio_stream(play_data: dict[str, Any]) -> dict[str, Any]:
-    audios = play_data.get("data", {}).get("dash", {}).get("audio") or []
-    if not audios:
-        raise RuntimeError("播放地址接口没有返回 DASH 音频流，可能需要完整登录 Cookie。")
-    return max(audios, key=lambda item: item.get("bandwidth") or 0)
+def upower_exclusive(view_data: dict[str, Any] | None) -> bool:
+    """True when the video is a 充电专属（专属视频档）video.
+
+    The view API marks these with ``data.is_upower_exclusive``; watching them
+    requires an account that has an active monthly charging subscription to the
+    uploader (e.g. a 30 元/月 tier), not merely a logged-in cookie.
+    """
+    return bool((view_data or {}).get("data", {}).get("is_upower_exclusive"))
 
 
-def audio_extension(audio_stream: dict[str, Any], audio_url: str) -> str:
+def pick_play_stream(play_data: dict[str, Any], cookie_configured: bool = False,
+                     exclusive: bool = False) -> tuple[dict[str, Any], str]:
+    """Pick the best downloadable stream from a playurl response.
+
+    Returns ``(stream, kind)`` where ``kind`` is ``"dash"`` (preferred, an
+    audio-only DASH stream) or ``"durl"`` (a whole-video MP4/FLV stream).
+
+    Bilibili only returns the DASH tree when the caller has sufficient
+    permission.  For login-required videos requested without a cookie it
+    silently omits ``data.dash`` and returns only ``data.durl`` (usually a
+    low-quality MP4).  Falling back to ``durl`` keeps the job working; the
+    audio is extracted afterwards via ffmpeg (or decoded directly by
+    faster-whisper when ffmpeg is unavailable).
+    """
+    if exclusive:
+        reason = (
+            "该视频是充电专属（专属视频档），需要开通 UP 主的包月充电（例如 30 元/月）"
+            "后才能观看；普通登录 Cookie 无法解锁。"
+        )
+    elif cookie_configured:
+        reason = "已配置 Cookie，但仍无法获取视频流：该视频可能仅登录可见、需要大会员，或已被下架。"
+    else:
+        reason = "未配置 Cookie：该视频可能仅登录可见、需要大会员，或已被下架。"
+    data = play_data.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "播放地址接口没有返回视频流数据" + f"（{reason}）"
+        )
+    audios = data.get("dash", {}).get("audio") or []
+    if audios:
+        return max(audios, key=lambda item: item.get("bandwidth") or 0), "dash"
+    durls = data.get("durl") or []
+    if durls:
+        return durls[0], "durl"
+    raise RuntimeError(
+        "播放地址接口既没有返回 DASH 音频流，也没有返回整段视频流。"
+        f"{reason}"
+        "如需解锁，需在服务器配置包含 SESSDATA 的 Bilibili 登录 Cookie"
+        "（BILIBILI_COOKIE 环境变量或 config.json 的 bilibili_cookie）。"
+    )
+
+
+def stream_url(stream: dict[str, Any]) -> str:
+    """Return the download URL of a DASH or durl stream entry."""
+    return stream.get("baseUrl") or stream.get("base_url") or stream.get("url") or ""
+
+
+def audio_extension(audio_stream: dict[str, Any], audio_url: str, kind: str = "dash") -> str:
+    if kind == "durl":
+        suffix = Path(urllib.parse.urlparse(audio_url).path).suffix.lower().lstrip(".")
+        return suffix if suffix in {"mp4", "flv", "m4s", "mkv"} else "mp4"
     mime_type = audio_stream.get("mimeType") or audio_stream.get("mime_type") or ""
     if "mp4" in mime_type:
         return "m4a"
@@ -725,24 +788,35 @@ def audio_extension(audio_stream: dict[str, Any], audio_url: str) -> str:
     return suffix if suffix in {"m4a", "mp3", "webm", "aac", "flac", "opus"} else "m4a"
 
 
-def download_file(url: str, path: Path, headers: dict[str, str], job: Job) -> None:
+def download_file(url: str, path: Path, headers: dict[str, str], job: Job,
+                  backup_urls: list[str] | None = None) -> None:
     proxy = os.getenv("BILIBILI_PROXY", "").strip()
     max_retries = 3
     last_error = None
+    urls = [url] + [u for u in (backup_urls or []) if u]
 
-    for attempt in range(max_retries):
-        try:
-            _download_file_attempt(url, path, headers, job, proxy, attempt)
-            return
-        except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError) as exc:
-            last_error = exc
-            if attempt < max_retries - 1:
-                wait = (attempt + 1) * 3
-                job.log(f"下载中断，{wait}秒后重试（{attempt + 1}/{max_retries}）...", job.progress)
-                time.sleep(wait)
-                check_cancelled(job)
-            else:
-                raise
+    for url_index, current_url in enumerate(urls):
+        if url_index > 0 and path.exists() and path.stat().st_size > 0:
+            # Partial data came from a previous URL; do not resume across URLs.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        for attempt in range(max_retries):
+            try:
+                _download_file_attempt(current_url, path, headers, job, proxy, attempt)
+                return
+            except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError) as exc:
+                last_error = exc
+                if attempt < max_retries - 1:
+                    wait = (attempt + 1) * 3
+                    job.log(f"下载中断，{wait}秒后重试（{attempt + 1}/{max_retries}）...", job.progress)
+                    time.sleep(wait)
+                    check_cancelled(job)
+                elif url_index < len(urls) - 1:
+                    job.log("当前地址下载失败，切换到备用地址...", job.progress)
+                else:
+                    raise
 
     if last_error:
         raise last_error
@@ -1246,7 +1320,8 @@ def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
     else:
         job._stage_end("字幕获取(无)")
         job._stage_begin()
-        audio_path = _download_page_audio(bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers, page_label)
+        audio_path = _download_page_audio(bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers,
+                                          page_label, exclusive=upower_exclusive(view_data))
         ffmpeg_path = shutil.which("ffmpeg")
         transcription_source = audio_path
         if ffmpeg_path:
@@ -1313,7 +1388,8 @@ def _fetch_page_subtitle(bvid: str, cid: int, out_dir: Path, job: Job,
 
 
 def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
-                          job: Job, headers: dict, page_label: str) -> Path:
+                          job: Job, headers: dict, page_label: str,
+                          exclusive: bool = False) -> Path:
     """Download audio for a specific page CID."""
     job.log(f"{page_label}正在获取音频流", 20)
 
@@ -1329,15 +1405,25 @@ def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
     if play_data is None:
         raise RuntimeError(f"无法获取播放地址：{last_error}")
 
-    audio_stream = pick_audio_stream(play_data)
-    audio_url = audio_stream.get("baseUrl") or audio_stream.get("base_url")
+    audio_stream, kind = pick_play_stream(
+        play_data,
+        cookie_configured=bool(headers.get("Cookie")),
+        exclusive=exclusive,
+    )
+    audio_url = stream_url(audio_stream)
     if not audio_url:
-        raise RuntimeError("播放地址接口没有返回音频 URL。")
+        raise RuntimeError("播放地址接口没有返回可下载的音频/视频 URL。")
 
-    extension = audio_extension(audio_stream, audio_url)
+    if kind == "durl":
+        if exclusive:
+            job.log(f"{page_label}该视频为充电专属（专属视频档），未开通包月充电时只能获取低清整段视频流，将下载后提取音频", 20)
+        else:
+            job.log(f"{page_label}未登录时接口只返回整段视频流（MP4/FLV），将下载后提取音频，音质可能低于 DASH", 20)
+    extension = audio_extension(audio_stream, audio_url, kind)
     audio_path = out_dir / f"{sanitize_filename(title)}.{extension}"
     job.log(f"{page_label}正在下载音频", 25)
-    download_file(audio_url, audio_path, headers, job)
+    download_file(audio_url, audio_path, headers, job,
+                  backup_urls=audio_stream.get("backup_url") or audio_stream.get("backupUrl") or [])
     return audio_path
 
 

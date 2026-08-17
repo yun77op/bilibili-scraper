@@ -23,6 +23,7 @@ from flask import Flask, Response, jsonify, redirect, request, send_file, sessio
 
 import auth
 import db as _db
+import kb as _kb
 from app import (
     CONFIG_FILE,
     ROOT,
@@ -56,8 +57,15 @@ def create_app() -> Flask:
     # ------------------------------------------------------------------
 
     @app.get("/")
+    def landing():
+        # 公开落地页；已登录用户直接进入工作台
+        if auth.current_user():
+            return redirect(url_for("workspace"))
+        return send_file(STATIC_DIR / "landing.html", mimetype="text/html; charset=utf-8")
+
+    @app.get("/app")
     @auth.login_required
-    def index():
+    def workspace():
         return send_file(STATIC_DIR / "index.html", mimetype="text/html; charset=utf-8")
 
     @app.get("/settings")
@@ -65,16 +73,21 @@ def create_app() -> Flask:
     def settings_page():
         return send_file(STATIC_DIR / "settings.html", mimetype="text/html; charset=utf-8")
 
+    @app.get("/kb")
+    @auth.login_required
+    def kb_page():
+        return send_file(STATIC_DIR / "kb.html", mimetype="text/html; charset=utf-8")
+
     @app.get("/login")
     def login_page():
         if auth.current_user():
-            return redirect(url_for("index"))
+            return redirect(url_for("workspace"))
         return send_file(STATIC_DIR / "login.html", mimetype="text/html; charset=utf-8")
 
     @app.get("/register")
     def register_page():
         if auth.current_user():
-            return redirect(url_for("index"))
+            return redirect(url_for("workspace"))
         return send_file(STATIC_DIR / "register.html", mimetype="text/html; charset=utf-8")
 
     # ------------------------------------------------------------------
@@ -409,6 +422,67 @@ def create_app() -> Flask:
             return jsonify({"error": "不能禁用自己"}), 400
         _db.update_user(user_id, is_active=not target["is_active"])
         return jsonify({"ok": True, "is_active": not target["is_active"]})
+
+    # ------------------------------------------------------------------
+    # 知识库（RAG 问答）
+    # ------------------------------------------------------------------
+
+    @app.get("/api/kb/status")
+    @auth.login_required
+    def api_kb_status():
+        try:
+            status = _kb.index_status()
+        except Exception as exc:
+            return jsonify({"error": f"索引状态读取失败：{exc}"}), 500
+        status["configured"] = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+        status["model"] = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        try:
+            status["samples"] = _kb.sample_questions()
+        except Exception:
+            status["samples"] = []
+        return jsonify(status)
+
+    @app.post("/api/kb/rebuild")
+    @auth.login_required
+    def api_kb_rebuild():
+        try:
+            index = _kb.rebuild_index(force=True)
+        except Exception as exc:
+            return jsonify({"error": f"索引重建失败：{exc}"}), 500
+        return jsonify({
+            "ok": True,
+            "articles": len(_kb._collect_docs()),
+            "chunks": index.get("num_docs", 0),
+            "built_at": index.get("built_at"),
+        })
+
+    @app.post("/api/kb/chat")
+    @auth.login_required
+    def api_kb_chat():
+        data = request.get_json(silent=True) or {}
+        question = str(data.get("question", "")).strip()
+        history = data.get("history") or []
+        if not question:
+            return jsonify({"error": "问题不能为空"}), 400
+        if len(question) > 2000:
+            return jsonify({"error": "问题过长，请精简到 2000 字以内"}), 400
+
+        def generate() -> Any:
+            try:
+                for ev in _kb.chat_stream(question, history):
+                    payload = ev.get("payload") or {}
+                    yield f"event: {ev['type']}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            except Exception as exc:  # 兜底：任何异常都以 error 事件结束
+                yield f"event: error\ndata: {json.dumps({'message': str(exc)}, ensure_ascii=False)}\n\n"
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # 反代（Nginx）下关闭缓冲，保证流式输出
+            },
+        )
 
     return app
 

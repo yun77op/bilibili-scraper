@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>知识库 - 视频转文章</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <navbar current="kb"></navbar>
+
+      <main class="shell">
+        <section class="workspace kb-workspace">
+          <header class="topbar">
+            <div>
+              <h1>📚 知识库</h1>
+              <p>基于全部已生成文章的检索问答：问它任何知识库里讲过的问题，回答会注明来源。</p>
+            </div>
+            <div class="topbar-right">
+              <div class="worker-status" :title="'知识库索引状态'">
+                <span class="worker-dot" :class="{ online: kbStatus.up_to_date, offline: kbStatus.up_to_date === false }"></span>
+                <span class="worker-text">{{ statusText() }}</span>
+              </div>
+              <button class="ghost" :disabled="kbStatus.building || rebuilding" @click="rebuild">
+                {{ rebuilding ? '重建中…' : '🔄 重建索引' }}
+              </button>
+              <button class="ghost" @click="clearChat" :disabled="messages.length === 0">🗑 清空对话</button>
+            </div>
+          </header>
+
+          <div class="kb-notice" v-if="kbStatus.configured === false">
+            ⚠️ 未配置 <code>DEEPSEEK_API_KEY</code>，无法生成回答。请在 <code>.env.local</code> 中配置后重启服务。
+          </div>
+
+          <div class="kb-chat" ref="chatBox">
+            <!-- 欢迎页（空对话） -->
+            <div class="kb-welcome" v-if="messages.length === 0">
+              <div class="kb-welcome-icon">💬</div>
+              <h2>向你的文章知识库提问</h2>
+              <p>当前收录 {{ kbStatus.articles || '…' }} 篇文章 · {{ kbStatus.chunks || '…' }} 个内容片段，回答基于文章内容生成并标注来源。</p>
+              <div class="kb-samples">
+                <button
+                  v-for="s in samples" :key="s"
+                  class="kb-sample" @click="ask(s)"
+                >{{ s }}</button>
+              </div>
+            </div>
+
+            <!-- 对话消息 -->
+            <div v-for="(m, i) in messages" :key="m.key" class="kb-msg" :class="m.role">
+              <div class="kb-msg-label" :title="m.role === 'user' ? '你' : '知识库助手'">{{ m.role === 'user' ? '👤' : '📚' }}</div>
+              <div class="kb-bubble">
+                <div
+                  v-if="m.role === 'user'"
+                  class="kb-user-text"
+                  v-text="m.content"
+                ></div>
+                <template v-else>
+                  <!-- 思考过程（可折叠） -->
+                  <details class="kb-reasoning" v-if="m.reasoning">
+                    <summary>💭 深度思考过程</summary>
+                    <div class="kb-reasoning-text" v-text="m.reasoning"></div>
+                  </details>
+                  <!-- 流式正文：渲染为 markdown -->
+                  <div class="kb-answer" :id="'kb-answer-' + m.key" v-html="m.html"></div>
+                  <div v-if="m.status === 'loading'" class="kb-typing">
+                    <span class="kb-typing-dot"></span><span class="kb-typing-dot"></span><span class="kb-typing-dot"></span>
+                  </div>
+                  <div v-if="m.error" class="kb-error">{{ m.error }}</div>
+                  <!-- 参考来源 -->
+                  <div class="kb-sources" v-if="m.sources && m.sources.length">
+                    <span class="kb-sources-label">参考来源</span>
+                    <span
+                      v-for="s in m.sources" :key="s.job_id + s.title"
+                      class="kb-source-chip" :title="s.url || ''"
+                    >{{ s.title }}</span>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+
+          <!-- 输入区 -->
+          <div class="kb-input-row">
+            <textarea
+              class="kb-input"
+              v-model="question"
+              :placeholder="sending ? '正在生成回答…' : '输入问题，Enter 发送，Shift+Enter 换行'"
+              rows="2"
+              :disabled="sending"
+              @keydown="onKeydown"
+            ></textarea>
+            <button class="kb-send" :disabled="sending || !question.trim()" @click="send">
+              {{ sending ? '…' : '发送 ➤' }}
+            </button>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/static/kb.js"></script>
+  </body>
+</html>

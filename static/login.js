@@ -22,7 +22,7 @@ const App = {
         });
         const data = await resp.json();
         if (resp.ok && data.ok) {
-          location.href = "/";
+          location.href = "/app";
         } else {
           error.value = data.error || "登录失败";
         }
