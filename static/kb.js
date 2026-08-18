@@ -24,15 +24,8 @@ const App = {
       model: "",
     });
 
-    // 示例问题：后端每次随机生成（主题池 + 随机文章）；接口异常时用本地兜底
-    const FALLBACK_SAMPLES = [
-      "Agent 的 Skill 命中率怎么保证？",
-      "大模型如何稳定地输出 JSON？",
-      "RAG 遇到 PDF 应该怎么处理？",
-      "斯坦福神经科学家讲了哪些提升大脑潜能的方法？",
-      "用 Codex 怎么搭一条 AI 视频生产线？",
-      "AI 找球员为什么没能成为大生意？",
-    ];
+    // 示例问题：后端每次随机从当前语料生成；接口异常时本地兜底为空（不展示写死问题）
+    const FALLBACK_SAMPLES = [];
     const samples = ref(FALLBACK_SAMPLES.slice());
 
     const statusText = () => {

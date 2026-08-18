@@ -39,7 +39,7 @@
               <div class="kb-welcome-icon">💬</div>
               <h2>向你的文章知识库提问</h2>
               <p>当前收录 {{ kbStatus.articles || '…' }} 篇文章 · {{ kbStatus.chunks || '…' }} 个内容片段，回答基于文章内容生成并标注来源。</p>
-              <div class="kb-samples">
+              <div class="kb-samples" v-if="samples.length">
                 <button
                   v-for="s in samples" :key="s"
                   class="kb-sample" @click="ask(s)"

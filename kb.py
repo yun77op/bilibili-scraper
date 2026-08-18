@@ -510,21 +510,8 @@ def _topic_titles(index: dict[str, Any], limit: int = 40) -> list[str]:
 # 示例问题（每次进入知识库随机变化）
 # ---------------------------------------------------------------------------
 
-# 固定主题池：覆盖知识库主要内容的优质提问（每次随机抽一部分）
-CURATED_SAMPLES = [
-    "Agent 的 Skill 命中率怎么保证？",
-    "大模型如何稳定地输出 JSON？",
-    "RAG 遇到 PDF 应该怎么处理？",
-    "斯坦福神经科学家讲了哪些提升大脑潜能的方法？",
-    "用 Codex 怎么搭一条 AI 视频生产线？",
-    "AI 找球员为什么没能成为大生意？",
-    "Agent 的 Checkpoint 机制是什么？",
-    "NotebookLM 怎么用来高效学习？",
-    "怎么做好时间管理？",
-    "Agent 高频面试都考哪些内容？",
-]
-
-# 语料标题 → 提问的模板（从当前文章随机抽，让示例随知识库内容变化）
+# 不保留任何写死的示例问题：示例全部从当前语料随机抽文章按模板生成，
+# 随语料内容变化——语料里没有的内容，示例里也不会出现，点了都能答上来。
 _TITLE_TEMPLATES = [
     "《{title}》这篇文章讲了什么？",
     "帮我总结一下《{title}》的核心要点",
@@ -533,25 +520,20 @@ _TITLE_TEMPLATES = [
 
 
 def sample_questions(count: int = 6) -> list[str]:
-    """随机生成示例问题：主题池抽一部分 + 从当前语料随机抽文章按模板生成。
+    """随机生成示例问题：从当前语料随机抽文章按模板生成。
 
-    每次调用结果不同；文章更新后标题类示例也会跟着变化。
+    每次调用结果不同；文章更新后示例也跟着变化。
     """
-    k = min(count, 4, len(CURATED_SAMPLES))
-    curated = random.sample(CURATED_SAMPLES, k=k)
     index = get_index()
     titles = [
         t for t in _topic_titles(index, limit=80)
         if len(t) >= 4 and t != "未命名文章"
     ]
     random.shuffle(titles)
-    title_qs = [
+    return [
         random.choice(_TITLE_TEMPLATES).format(title=t)
-        for t in titles[: max(0, count - len(curated))]
+        for t in titles[:count]
     ]
-    out = curated + title_qs
-    random.shuffle(out)
-    return out
 
 
 # ---------------------------------------------------------------------------
