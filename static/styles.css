@@ -23,6 +23,11 @@ body {
   background: var(--bg);
 }
 
+/* Vue 挂载前隐藏未编译模板，避免闪现 {{ stageText }} 等插值 */
+[v-cloak] {
+  display: none;
+}
+
 button,
 input,
 textarea {
