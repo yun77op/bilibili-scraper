@@ -103,10 +103,33 @@ class MarkdownToBlocksTest(unittest.TestCase):
         block = markdown_to_blocks(md)[0]
         self.assertEqual(block["code"]["language"], "plain text")
 
-    def test_divider_and_table_as_code(self):
+    def test_divider_and_table(self):
         md = "---\n\n| a | b |\n| --- | --- |\n| 1 | 2 |"
         types = self._types(md)
-        self.assertEqual(types, ["divider", "code"])
+        self.assertEqual(types, ["divider", "table"])
+        table = markdown_to_blocks(md)[1]["table"]
+        self.assertEqual(table["table_width"], 2)
+        self.assertTrue(table["has_column_header"])
+        rows = table["children"]
+        self.assertEqual(len(rows), 2)
+        header = [c[0]["text"]["content"] for c in rows[0]["table_row"]["cells"]]
+        body = [c[0]["text"]["content"] for c in rows[1]["table_row"]["cells"]]
+        self.assertEqual(header, ["a", "b"])
+        self.assertEqual(body, ["1", "2"])
+
+    def test_chinese_table_and_toc(self):
+        md = (
+            "- [引言](#引言)\n\n"
+            "| 岗位类型 | 驱动来源 |\n"
+            "| --- | --- |\n"
+            "| 管道工 | 芯片厂、AI 工厂等基础设施施工 |\n"
+            "| 电工 | 数据中心和 AI 工厂的电力系统建设 |\n"
+        )
+        blocks = markdown_to_blocks(md)
+        self.assertEqual([b["type"] for b in blocks], ["table_of_contents", "table"])
+        cells = blocks[1]["table"]["children"][1]["table_row"]["cells"]
+        self.assertIn("管道工", cells[0][0]["text"]["content"])
+        self.assertIn("芯片厂", cells[1][0]["text"]["content"])
 
     def test_inline_bold_and_link(self):
         blocks = markdown_to_blocks("这是 **重点** 和 [链接](https://ex.com)")
@@ -124,14 +147,10 @@ class MarkdownToBlocksTest(unittest.TestCase):
                 urls.append((t.get("text") or {}).get("link", {}).get("url") if (t.get("text") or {}).get("link") else None)
         return urls
 
-    def test_toc_anchor_links_are_unlinked(self):
+    def test_toc_anchor_links_become_notion_toc(self):
         md = "- [引言](#引言)\n- [总结](#总结)"
         blocks = markdown_to_blocks(md)
-        self.assertEqual([b["type"] for b in blocks], ["bulleted_list_item", "bulleted_list_item"])
-        for block in blocks:
-            for t in block["bulleted_list_item"]["rich_text"]:
-                self.assertIsNone((t.get("text") or {}).get("link"))
-        self.assertEqual(blocks[0]["bulleted_list_item"]["rich_text"][0]["text"]["content"], "引言")
+        self.assertEqual([b["type"] for b in blocks], ["table_of_contents"])
 
     def test_markdown_title_and_bare_host(self):
         md = '[a](https://example.com "官网") 和 [b](www.bilibili.com/video/BV1xx)'

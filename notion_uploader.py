@@ -64,7 +64,6 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _UL_RE = re.compile(r"^(\s*)([-*+])\s+(.*)$")
 _OL_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.*)$")
 _HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
-_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}")
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +507,50 @@ def _block(kind: str, text: str, *, inline: bool = True, **extra: Any) -> dict[s
     return {"object": "block", "type": kind, kind: payload}
 
 
+def _split_table_cells(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+_TABLE_DIVIDER_CELL_RE = re.compile(r"^:?-{3,}:?$")
+
+
+def _is_table_divider(line: str) -> bool:
+    cells = _split_table_cells(line)
+    return bool(cells) and all(_TABLE_DIVIDER_CELL_RE.match(c.replace(" ", "")) for c in cells)
+
+
+def _table_block(header: list[str], rows: list[list[str]]) -> dict[str, Any]:
+    """Markdown table → Notion table with nested table_row children."""
+    width = max([len(header)] + [len(r) for r in rows] + [1])
+    width = min(max(width, 1), 100)
+    children: list[dict[str, Any]] = []
+    for row in [header, *rows]:
+        cells = (list(row) + [""] * width)[:width]
+        children.append({
+            "object": "block",
+            "type": "table_row",
+            "table_row": {"cells": [_parse_inline(c) for c in cells]},
+        })
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": width,
+            "has_column_header": True,
+            "has_row_header": False,
+            "children": children,
+        },
+    }
+
+
+_TOC_ITEM_RE = re.compile(r"^\[[^\]]+\]\(#[^)]+\)$")
+
+
 def _code_language(lang: str) -> str:
     key = (lang or "").strip().lower()
     if key in _CODE_ALIASES:
@@ -591,21 +634,35 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
         ol = _OL_RE.match(line)
         if ul or ol:
             kind = "bulleted_list_item" if ul else "numbered_list_item"
+            items: list[str] = []
             while i < n:
                 cur = _UL_RE.match(lines[i]) if kind == "bulleted_list_item" else _OL_RE.match(lines[i])
                 if not cur:
                     break
-                blocks.append(_block(kind, cur.group(3)))
+                items.append(cur.group(3))
                 i += 1
+            if items and all(_TOC_ITEM_RE.match(x.strip()) for x in items):
+                blocks.append({
+                    "object": "block",
+                    "type": "table_of_contents",
+                    "table_of_contents": {"color": "default"},
+                })
+            else:
+                for item in items:
+                    blocks.append(_block(kind, item))
             continue
 
-        if "|" in line and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1]):
-            table: list[str] = [line]
-            i += 1
-            while i < n and "|" in lines[i]:
-                table.append(lines[i])
+        if "|" in line and i + 1 < n and _is_table_divider(lines[i + 1]):
+            header = _split_table_cells(line)
+            i += 2
+            body: list[list[str]] = []
+            while i < n and "|" in lines[i] and lines[i].strip() and not _HEADING_RE.match(lines[i]):
+                if _is_table_divider(lines[i]):
+                    i += 1
+                    continue
+                body.append(_split_table_cells(lines[i]))
                 i += 1
-            blocks.append(_code_block("\n".join(table), "plain text"))
+            blocks.append(_table_block(header, body))
             continue
 
         if not line.strip():
@@ -623,6 +680,7 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
                 or nxt.lstrip().startswith(">")
                 or _UL_RE.match(nxt)
                 or _OL_RE.match(nxt)
+                or (i + 1 < n and "|" in nxt and _is_table_divider(lines[i + 1]))
             ):
                 break
             para.append(nxt)
