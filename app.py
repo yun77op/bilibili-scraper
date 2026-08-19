@@ -49,6 +49,9 @@ BILIBILI_PLAYURL_APIS = [
 ]
 BILIBILI_PLAYER_V2_API = "https://api.bilibili.com/x/player/v2"
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+GROQ_CHUNK_SECONDS = 600
 BILIBILI_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -951,6 +954,227 @@ def wav_duration_seconds(path: Path) -> float:
         return frames / float(rate)
 
 
+def transcribe_provider() -> str:
+    """Return ``groq`` or ``local``. Unset → groq when ``GROQ_API_KEY`` exists."""
+    raw = os.getenv("TRANSCRIBE_PROVIDER", "").strip().lower()
+    if raw in ("groq", "local"):
+        return raw
+    return "groq" if os.getenv("GROQ_API_KEY", "").strip() else "local"
+
+
+def transcribe_language(default: str | None = None) -> str | None:
+    raw = os.getenv("TRANSCRIBE_LANGUAGE", "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("auto", "detect", "none"):
+        return None
+    return raw
+
+
+def format_transcript_segments(segments: list[tuple[float, float, str]]) -> str:
+    lines: list[str] = []
+    for start, end, text in segments:
+        text = text.strip()
+        if not text:
+            continue
+        lines.append(f"[{format_timestamp(start)} - {format_timestamp(end)}] {text}")
+    return "\n".join(lines).strip()
+
+
+def _audio_mime(path: Path) -> str:
+    return {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".mpeg": "audio/mpeg",
+        ".mpga": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+    }.get(path.suffix.lower(), "application/octet-stream")
+
+
+def probe_audio_duration(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            out = subprocess.check_output(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            return max(float(out.strip()), 0.0)
+        except (subprocess.CalledProcessError, ValueError, OSError):
+            pass
+    if path.suffix.lower() == ".wav":
+        try:
+            return wav_duration_seconds(path)
+        except wave.Error:
+            pass
+    return max(path.stat().st_size * 8 / 64000, 1.0)
+
+
+def _groq_chunks(audio_path: Path, out_dir: Path, job: Job) -> list[tuple[Path, float]]:
+    """Compress to 64kbps mp3 and split if over Groq's free-tier 25MB cap."""
+    ffmpeg = shutil.which("ffmpeg")
+    source = audio_path
+    if ffmpeg:
+        mp3_path = out_dir / "audio-groq.mp3"
+        job.log("正在压缩音频以便云端转写", 45)
+        run_command(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(audio_path),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-b:a",
+                "64k",
+                str(mp3_path),
+            ],
+            out_dir,
+            job,
+        )
+        source = mp3_path
+    if source.stat().st_size <= GROQ_MAX_UPLOAD_BYTES:
+        return [(source, 0.0)]
+    if not ffmpeg:
+        raise RuntimeError(
+            f"音频 {source.stat().st_size} 字节超过 Groq 上传限制，且未安装 ffmpeg 无法分段"
+        )
+    chunk_dir = out_dir / "groq-chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    job.log("音频超过 Groq 单文件上限，按 10 分钟分段上传", 46)
+    run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-f",
+            "segment",
+            "-segment_time",
+            str(GROQ_CHUNK_SECONDS),
+            "-c",
+            "copy",
+            str(chunk_dir / "chunk-%03d.mp3"),
+        ],
+        out_dir,
+        job,
+    )
+    chunks = sorted(chunk_dir.glob("chunk-*.mp3"))
+    if not chunks:
+        raise RuntimeError("音频分段失败，未生成分片文件")
+    result: list[tuple[Path, float]] = []
+    offset = 0.0
+    for chunk in chunks:
+        result.append((chunk, offset))
+        offset += probe_audio_duration(chunk)
+    return result
+
+
+def _groq_payload_segments(payload: dict[str, Any], offset: float) -> list[tuple[float, float, str]]:
+    triples: list[tuple[float, float, str]] = []
+    for seg in payload.get("segments") or []:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start") or 0.0) + offset
+        end = float(seg.get("end") or start) + offset
+        triples.append((start, end, text))
+    if triples:
+        return triples
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return []
+    duration = float(payload.get("duration") or 0.0)
+    return [(offset, offset + duration, text)]
+
+
+def transcribe_with_groq(audio_path: Path, out_dir: Path, job: Job, page_label: str = "") -> str:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("未配置 GROQ_API_KEY")
+    model = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo").strip() or "whisper-large-v3-turbo"
+    language = transcribe_language()
+    lang_note = language or "自动检测"
+    job.log(f"{page_label}正在转写音频，Groq：{model}（{lang_note}）", 50)
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    triples: list[tuple[float, float, str]] = []
+    chunks = _groq_chunks(audio_path, out_dir, job)
+    detected = ""
+    for index, (chunk_path, offset) in enumerate(chunks):
+        check_cancelled(job)
+        if len(chunks) > 1:
+            job.log(f"{page_label}Groq 转写分片 {index + 1}/{len(chunks)}", 50 + int(index / len(chunks) * 15))
+        data: dict[str, str] = {
+            "model": model,
+            "response_format": "verbose_json",
+            "temperature": "0",
+        }
+        if language:
+            data["language"] = language
+        with chunk_path.open("rb") as fh:
+            resp = requests.post(
+                GROQ_TRANSCRIBE_URL,
+                headers=headers,
+                files={"file": (chunk_path.name, fh, _audio_mime(chunk_path))},
+                data=data,
+                timeout=180,
+            )
+        if resp.status_code != 200:
+            detail = resp.text.strip()[:300]
+            raise RuntimeError(f"Groq 转写失败 HTTP {resp.status_code}：{detail}")
+        payload = resp.json()
+        if not detected:
+            detected = str(payload.get("language") or "")
+        triples.extend(_groq_payload_segments(payload, offset))
+
+    text = format_transcript_segments(triples)
+    if not text:
+        raise RuntimeError(f"Groq 转写结果为空，检测语言：{detected or '未知'}")
+    job.progress = 70
+    job.updated_at = time.time()
+    return text
+
+
+def transcribe_audio(audio_path: Path, out_dir: Path, job: Job, page_label: str = "") -> str:
+    """Transcribe via Groq when configured, otherwise local faster-whisper.
+
+    Groq failures fall back to the local model so a missing key or API outage
+    does not fail the whole job.
+    """
+    provider = transcribe_provider()
+    if provider == "groq":
+        try:
+            return transcribe_with_groq(audio_path, out_dir, job, page_label)
+        except JobCancelledError:
+            raise
+        except Exception as exc:
+            job.log(f"{page_label}Groq 转写失败（{exc}），回退到本地 Whisper", 50)
+    ffmpeg_path = shutil.which("ffmpeg")
+    source = audio_path
+    if ffmpeg_path:
+        source = convert_for_transcription(audio_path, out_dir, job)
+    else:
+        job.log(f"{page_label}未找到 ffmpeg，直接使用下载的音频进行转写", 35)
+    return transcribe_with_faster_whisper(source, job, page_label)
+
+
 def transcribe_with_faster_whisper(audio_path: Path, job: Job, page_label: str = "") -> str:
     configure_cuda_dll_paths()
     HF_HOME.mkdir(parents=True, exist_ok=True)
@@ -983,7 +1207,7 @@ def transcribe_with_faster_whisper(audio_path: Path, job: Job, page_label: str =
         duration = max(wav_duration_seconds(audio_path), 1.0)
     segments, info = model.transcribe(
         str(audio_path),
-        language=os.getenv("TRANSCRIBE_LANGUAGE", "zh"),
+        language=transcribe_language(default="zh"),
         vad_filter=True,
         beam_size=5,
     )
@@ -1322,15 +1546,9 @@ def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
         job._stage_begin()
         audio_path = _download_page_audio(bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers,
                                           page_label, exclusive=upower_exclusive(view_data))
-        ffmpeg_path = shutil.which("ffmpeg")
-        transcription_source = audio_path
-        if ffmpeg_path:
-            transcription_source = convert_for_transcription(audio_path, out_dir, job)
-        else:
-            job.log(f"{page_label}未找到 ffmpeg，直接使用下载的音频进行转写", 35)
         job._stage_end("音频下载")
         job._stage_begin()
-        transcript = transcribe_with_faster_whisper(transcription_source, job, page_label)
+        transcript = transcribe_audio(audio_path, out_dir, job, page_label)
         job._stage_end("语音转写")
 
     transcript_path = out_dir / "transcript.txt"
@@ -1536,15 +1754,9 @@ def _process_youtube(job: Job) -> None:
         job._stage_end("字幕获取(无)")
         job._stage_begin()
         audio_path = download_youtube_audio(job.url, out_dir, job, info)
-        ffmpeg_path = shutil.which("ffmpeg")
-        transcription_source = audio_path
-        if ffmpeg_path:
-            transcription_source = convert_for_transcription(audio_path, out_dir, job)
-        else:
-            job.log("未找到 ffmpeg，直接使用下载的音频进行转写", 35)
         job._stage_end("音频下载")
         job._stage_begin()
-        transcript = transcribe_with_faster_whisper(transcription_source, job)
+        transcript = transcribe_audio(audio_path, out_dir, job)
         job._stage_end("语音转写")
     transcript_path = out_dir / "transcript.txt"
     transcript_path.write_text(transcript, encoding="utf-8")

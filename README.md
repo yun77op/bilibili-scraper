@@ -94,13 +94,18 @@ HF_HUB_DISABLE_XET=1
 WHISPER_DEVICE=auto
 WHISPER_COMPUTE_TYPE=auto
 WHISPER_MODEL=base
-TRANSCRIBE_LANGUAGE=zh
+TRANSCRIBE_LANGUAGE=auto
+TRANSCRIBE_PROVIDER=
+GROQ_API_KEY=
+GROQ_WHISPER_MODEL=whisper-large-v3-turbo
 FLASK_SECRET_KEY=    # 会话签名密钥；不填则首次启动自动生成并写入 .env.local
 ```
 
 `BILIBILI_PROXY` 同时用于 Bilibili API 和 YouTube 访问，所有网络请求（包括模型下载）都会经过该代理。
 
 没有配置 `DEEPSEEK_API_KEY` 时，系统会生成基础整理稿，但不会进行深度改写。
+
+配置了 `GROQ_API_KEY` 后，无字幕视频会走 Groq Whisper（默认 `whisper-large-v3-turbo`），失败则回退到本地 faster-whisper。强制本地转写可设 `TRANSCRIBE_PROVIDER=local`。
 
 ### Whisper 模型
 

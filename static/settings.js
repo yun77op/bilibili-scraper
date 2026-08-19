@@ -55,7 +55,7 @@ const App = {
         isAdmin.value = true;
         serverInfo.value = [
           `DeepSeek：${cfg.deepseek_configured ? "已配置 ✓" : "未配置（需在服务器 .env.local 设置 DEEPSEEK_API_KEY）"}`,
-          `模型：${cfg.deepseek_model || ""} ｜ Whisper 设备：${cfg.whisper_device || ""}`,
+          `模型：${cfg.deepseek_model || ""} ｜ 转写：${cfg.transcribe_provider === "groq" ? `Groq ${cfg.groq_model || ""}${cfg.groq_configured ? "" : "（未配置 GROQ_API_KEY）"}` : `本地 ${cfg.whisper_device || ""}`}`,
           `Worker：${cfg.worker_alive ? "在线" : "离线"}`,
         ];
         loadUsers();

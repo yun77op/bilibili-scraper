@@ -31,6 +31,7 @@ from app import (
     job_download_files,
     load_config,
     save_config,
+    transcribe_provider,
     upload_job_to_drive,
     write_article_html,
 )
@@ -158,6 +159,9 @@ def create_app() -> Flask:
             "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
             "deepseek_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
             "whisper_device": os.getenv("WHISPER_DEVICE", "auto"),
+            "transcribe_provider": transcribe_provider(),
+            "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
+            "groq_model": os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"),
             "worker_alive": _worker_alive(),
         })
 
