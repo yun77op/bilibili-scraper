@@ -1,0 +1,14 @@
+[Unit]
+Description=bilibili-scraper worker %i
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/soft/projects/bilibili-scraper
+EnvironmentFile=/home/soft/projects/bilibili-scraper/.env.local
+ExecStart=/home/soft/projects/bilibili-scraper/.venv/bin/python worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

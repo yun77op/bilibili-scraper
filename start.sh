@@ -12,6 +12,7 @@ PID_DIR="$SCRIPT_DIR/.pids"
 LOG_DIR="$SCRIPT_DIR/logs"
 SERVER_LOG="$LOG_DIR/server.log"
 WORKER_LOG="$LOG_DIR/worker.log"
+WORKER_COUNT="${WORKER_COUNT:-2}"
 
 echo "=== 视频转文章 — 启动 ==="
 
@@ -71,22 +72,27 @@ fi
 echo "  OK HTTP 服务已启动 (PID: $SERVER_PID)"
 
 # 5. 启动 Worker
-echo "[3/3] 启动后台 Worker..."
-nohup "$PYTHON" worker.py > "$WORKER_LOG" 2>&1 &
-WORKER_PID=$!
-echo "$WORKER_PID" > "$PID_DIR/worker.pid"
-
-sleep 1
-if kill -0 "$WORKER_PID" 2>/dev/null; then
-    echo "  OK Worker 已启动 (PID: $WORKER_PID)"
-else
-    echo "  WARN Worker 进程已退出，查看日志: $WORKER_LOG"
-fi
+echo "[3/3] 启动后台 Worker × ${WORKER_COUNT}..."
+for i in $(seq 1 "$WORKER_COUNT"); do
+    log="$LOG_DIR/worker-$i.log"
+    if [ "$WORKER_COUNT" -eq 1 ]; then
+        log="$WORKER_LOG"
+    fi
+    nohup "$PYTHON" worker.py > "$log" 2>&1 &
+    WORKER_PID=$!
+    echo "$WORKER_PID" > "$PID_DIR/worker-$i.pid"
+    sleep 1
+    if kill -0 "$WORKER_PID" 2>/dev/null; then
+        echo "  OK Worker $i 已启动 (PID: $WORKER_PID)"
+    else
+        echo "  WARN Worker $i 已退出，查看日志: $log"
+    fi
+done
 
 echo ""
 echo "----------------------------------------"
 echo "  Web UI:    http://${HOST}:${PORT}"
 echo "  Server log: $SERVER_LOG"
-echo "  Worker log: $WORKER_LOG"
+echo "  Worker log: $LOG_DIR/worker-*.log"
 echo "  停止服务:   ./stop.sh"
 echo "----------------------------------------"

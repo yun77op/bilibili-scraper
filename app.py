@@ -17,11 +17,17 @@ import urllib.parse
 import urllib.request
 import uuid
 import wave
-
-import requests
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+
+import requests
 
 
 from gdrive_uploader import (
@@ -1175,7 +1181,37 @@ def transcribe_audio(audio_path: Path, out_dir: Path, job: Job, page_label: str 
     return transcribe_with_faster_whisper(source, job, page_label)
 
 
+@contextmanager
+def _exclusive_file_lock(path: Path, job: Job, page_label: str) -> Iterator[None]:
+    """Serialize local Whisper so two workers cannot both load the model."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = path.open("a+")
+    locked = False
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                job.log(f"{page_label}本地 Whisper 已被占用，等待空闲…", 50)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        yield
+    finally:
+        if locked and fcntl is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
+
 def transcribe_with_faster_whisper(audio_path: Path, job: Job, page_label: str = "") -> str:
+    lock_path = ROOT / ".pids" / "whisper.lock"
+    with _exclusive_file_lock(lock_path, job, page_label):
+        return _transcribe_with_faster_whisper_locked(audio_path, job, page_label)
+
+
+def _transcribe_with_faster_whisper_locked(audio_path: Path, job: Job, page_label: str = "") -> str:
     configure_cuda_dll_paths()
     HF_HOME.mkdir(parents=True, exist_ok=True)
     WHISPER_MODEL_DIR.mkdir(parents=True, exist_ok=True)

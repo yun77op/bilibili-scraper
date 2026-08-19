@@ -4,13 +4,14 @@ Replaces the in-memory ``jobs`` dict / ``job_queue`` list from the original
 monolithic app so that the HTTP server and the background worker can run as
 independent processes while sharing job state.
 
-Concurrency: SQLite in WAL mode + ``busy_timeout`` is safe for one writer
-(worker) and multiple readers (server threads) on a local filesystem.
+Concurrency: SQLite in WAL mode + ``busy_timeout`` is safe for a few worker
+processes (claim uses BEGIN IMMEDIATE) plus multiple readers (server threads).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -23,7 +24,7 @@ def _connect() -> sqlite3.Connection:
     """Return a new connection with WAL mode and a generous busy timeout."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=15000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -86,6 +87,7 @@ def init_db() -> None:
         for stmt in (
             "ALTER TABLE jobs ADD COLUMN title TEXT DEFAULT ''",
             "ALTER TABLE jobs ADD COLUMN user_id TEXT DEFAULT ''",
+            "ALTER TABLE jobs ADD COLUMN worker_pid INTEGER DEFAULT 0",
         ):
             try:
                 conn.execute(stmt)
@@ -189,9 +191,10 @@ def claim_next_queued_job() -> dict[str, Any] | None:
         now = time.time()
         conn.execute(
             """UPDATE jobs
-               SET status = 'running', stage = '任务已开始', progress = 5, updated_at = ?
+               SET status = 'running', stage = '任务已开始', progress = 5,
+                   worker_pid = ?, updated_at = ?
                WHERE id = ?""",
-            (now, job_id),
+            (os.getpid(), now, job_id),
         )
         conn.commit()
         return _row_to_dict(
@@ -307,20 +310,41 @@ def set_worker_heartbeat() -> None:
         conn.close()
 
 
-def cleanup_stale_jobs() -> int:
-    """Reset any stale 'running' jobs (left by a killed worker) back to 'queued'.
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
-    Returns the number of jobs that were reset.
+
+def cleanup_stale_jobs() -> int:
+    """Requeue running jobs whose worker process is gone.
+
+    Does **not** touch jobs owned by a still-living PID, so starting a second
+    worker cannot steal an in-flight task.
     """
     conn = _connect()
     try:
-        cursor = conn.execute(
-            """UPDATE jobs
-               SET status = 'queued', stage = '排队等待（重试）', error = ''
+        rows = conn.execute(
+            """SELECT id, worker_pid FROM jobs
                WHERE status = 'running' AND id != '__worker_heartbeat__'"""
+        ).fetchall()
+        stale_ids = [row["id"] for row in rows if not _pid_is_alive(int(row["worker_pid"] or 0))]
+        if not stale_ids:
+            return 0
+        now = time.time()
+        conn.executemany(
+            """UPDATE jobs
+               SET status = 'queued', stage = '排队等待（重试）', error = '',
+                   worker_pid = 0, updated_at = ?
+               WHERE id = ? AND status = 'running'""",
+            [(now, job_id) for job_id in stale_ids],
         )
         conn.commit()
-        return cursor.rowcount
+        return len(stale_ids)
     finally:
         conn.close()
 

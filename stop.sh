@@ -30,6 +30,11 @@ stop_by_pid_file() {
 
 stop_by_pid_file "$PID_DIR/server.pid" "server"
 stop_by_pid_file "$PID_DIR/worker.pid" "worker"
+for pid_file in "$PID_DIR"/worker-*.pid; do
+    [ -f "$pid_file" ] || continue
+    name=$(basename "$pid_file" .pid)
+    stop_by_pid_file "$pid_file" "$name"
+done
 
 # Fallback: port-based
 SERVER_PID=$(lsof -ti ":$PORT" 2>/dev/null || true)

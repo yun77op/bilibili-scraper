@@ -126,16 +126,16 @@ def run_loop(poll_interval: float = 2.0) -> None:
     """Main worker loop: claim → process → repeat."""
     global _current_job_id
 
-    # Clean up any stale jobs left by a previously killed worker
     stale_count = cleanup_stale_jobs()
     if stale_count:
         print(f"[worker] 清理了 {stale_count} 个僵尸任务", file=sys.stderr)
 
-    print("[worker] 已启动，等待任务...", file=sys.stderr)
+    print(f"[worker] 已启动 pid={os.getpid()}，等待任务...", file=sys.stderr)
     set_worker_heartbeat()
 
     while not shutdown_requested:
         try:
+            cleanup_stale_jobs()
             job_data = claim_next_queued_job()
         except Exception as exc:
             print(f"[worker] 查询队列失败: {exc}", file=sys.stderr)
