@@ -157,7 +157,7 @@ def create_app() -> Flask:
             },
             "gdrive_authenticated": gdrive_authed,
             "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
-            "deepseek_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+            "deepseek_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
             "whisper_device": os.getenv("WHISPER_DEVICE", "auto"),
             "transcribe_provider": transcribe_provider(),
             "groq_configured": bool(os.getenv("GROQ_API_KEY", "").strip()),

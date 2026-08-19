@@ -1347,7 +1347,7 @@ def request_deepseek_article(transcript: str, job: Job, page_label: str = "") ->
     if not api_key:
         raise RuntimeError("缺少 DEEPSEEK_API_KEY，无法调用 DeepSeek 整理文章。")
 
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
     payload = {
         "model": model,
         "messages": [

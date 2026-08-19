@@ -86,7 +86,7 @@ Whisper 默认使用 `auto` 模式，自动选择最佳设备：
 
 ```bash
 DEEPSEEK_API_KEY=sk-your-api-key
-DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_MODEL=deepseek-v4-flash
 BILIBILI_PROXY=http://127.0.0.1:7897
 HTTP_PROXY=http://127.0.0.1:7897
 HTTPS_PROXY=http://127.0.0.1:7897
