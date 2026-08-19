@@ -1412,6 +1412,51 @@ pre:has(> code.language-mermaid) svg foreignObject p {
   text-decoration: underline;
 }
 
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.auth-google {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  text-decoration: none;
+  box-sizing: border-box;
+}
+
+.auth-google:hover {
+  background: #f7f7f7;
+  border-color: #c5c5c5;
+}
+
+.auth-google svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
 /* ── 设置页 ─────────────────────────────────── */
 
 .hint {

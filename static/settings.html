@@ -104,7 +104,10 @@
                     <div class="user-info">
                       <span class="user-name">{{ u.username }}</span>
                       <span class="user-meta">
-                        {{ u.is_admin ? "管理员" : "普通用户" }} · 注册于 {{ fmtDate(u.created_at) }}
+                        {{ u.is_admin ? "管理员" : "普通用户" }}
+                        <template v-if="u.google"> · Google</template>
+                        <template v-if="u.email"> · {{ u.email }}</template>
+                        · 注册于 {{ fmtDate(u.created_at) }}
                         <template v-if="u.last_login_at"> · 最近登录 {{ fmtDate(u.last_login_at) }}</template>
                       </span>
                     </div>

@@ -18,8 +18,10 @@ import zipfile
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, redirect, request, send_file, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import auth
 import db as _db
@@ -47,11 +49,25 @@ _REGISTER_LIMIT = 5
 _register_attempts: dict[str, list[float]] = {}
 
 
+def _public_base_url() -> str:
+    """Canonical public origin for OAuth redirect URIs.
+
+    Prefer ``PUBLIC_BASE_URL`` (e.g. https://bilibili-scraper.shuilong.uk) so
+    callbacks stay correct behind Nginx.  Falls back to the incoming request.
+    """
+    env = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if env:
+        return env
+    return request.url_root.rstrip("/")
+
+
 def create_app() -> Flask:
     app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
     app.secret_key = auth.ensure_secret_key()
     app.permanent_session_lifetime = timedelta(days=7)
     app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # JSON bodies
+    # 反代 HTTPS 时用 X-Forwarded-Proto / Host 生成正确的 OAuth 回调地址
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
     # ------------------------------------------------------------------
     # Pages
@@ -128,6 +144,71 @@ def create_app() -> Flask:
     def api_logout():
         auth.logout_user()
         return jsonify({"ok": True})
+
+    @app.get("/api/auth/google/status")
+    def api_google_login_status():
+        return jsonify({"enabled": auth.google_login_enabled()})
+
+    @app.get("/api/auth/google")
+    def api_google_login_start():
+        if auth.current_user():
+            return redirect(url_for("workspace"))
+        redirect_uri = _public_base_url() + "/api/auth/google/callback"
+        try:
+            auth_url, state, code_verifier = auth.google_login_url(redirect_uri)
+        except FileNotFoundError as exc:
+            return redirect("/login?error=" + quote(str(exc)))
+        except ValueError as exc:
+            return redirect("/login?error=" + quote(str(exc)))
+        except Exception as exc:
+            return redirect("/login?error=" + quote(f"无法开始 Google 登录：{exc}"))
+        session["google_oauth_state"] = state
+        session["google_oauth_verifier"] = code_verifier
+        return redirect(auth_url)
+
+    @app.get("/api/auth/google/callback")
+    def api_google_login_callback():
+        if auth.current_user():
+            return redirect(url_for("workspace"))
+        if request.args.get("error"):
+            denied = request.args.get("error")
+            msg = "已取消 Google 登录" if denied == "access_denied" else f"Google 登录失败：{denied}"
+            return redirect("/login?error=" + quote(msg))
+        state = request.args.get("state", "")
+        code = request.args.get("code", "")
+        expected = session.pop("google_oauth_state", None)
+        code_verifier = session.pop("google_oauth_verifier", "") or ""
+        if not expected or state != expected:
+            return redirect("/login?error=" + quote("授权会话已失效，请重新登录"))
+        redirect_uri = _public_base_url() + "/api/auth/google/callback"
+        try:
+            profile = auth.complete_google_oauth(code, redirect_uri, code_verifier)
+        except ValueError as exc:
+            return redirect("/login?error=" + quote(str(exc)))
+        except Exception as exc:
+            return redirect("/login?error=" + quote(f"Google 登录失败：{exc}"))
+
+        existing = _db.get_user_by_google_sub(profile["sub"])
+        if existing is None:
+            now = time.time()
+            ip = request.remote_addr or "?"
+            attempts = [t for t in _register_attempts.get(ip, []) if now - t < _REGISTER_WINDOW]
+            if len(attempts) >= _REGISTER_LIMIT:
+                return redirect(
+                    "/login?error=" + quote(f"注册过于频繁，请 {_REGISTER_WINDOW // 60} 分钟后再试")
+                )
+            attempts.append(now)
+            _register_attempts[ip] = attempts
+
+        ok, message, user = auth.find_or_create_google_user(
+            sub=profile["sub"],
+            email=profile.get("email", ""),
+            name=profile.get("name", ""),
+        )
+        if not ok or user is None:
+            return redirect("/login?error=" + quote(message))
+        auth.login_user(user)
+        return redirect(url_for("workspace"))
 
     # ------------------------------------------------------------------
     # Config / settings
@@ -322,7 +403,7 @@ def create_app() -> Flask:
     @auth.login_required
     def api_gdrive_auth_url():
         try:
-            redirect_uri = request.url_root.rstrip("/") + "/api/gdrive/callback"
+            redirect_uri = _public_base_url() + "/api/gdrive/callback"
             auth_url, state = gdrive_get_auth_url(redirect_uri)
             session["gdrive_state"] = state
             return jsonify({"url": auth_url, "state": state})
@@ -412,6 +493,8 @@ def create_app() -> Flask:
                 "is_active": u["is_active"],
                 "created_at": u["created_at"],
                 "last_login_at": u["last_login_at"],
+                "google": bool(u.get("google_sub")),
+                "email": u.get("email") or "",
             })
         return jsonify({"users": users})
 

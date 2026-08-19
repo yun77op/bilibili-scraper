@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS users (
     id              TEXT PRIMARY KEY,
     username        TEXT    NOT NULL UNIQUE,
     password_hash   TEXT    NOT NULL,
+    google_sub      TEXT,
+    email           TEXT    DEFAULT '',
     is_admin        INTEGER DEFAULT 0,
     is_active       INTEGER DEFAULT 1,
     settings        TEXT    DEFAULT '{}',
@@ -88,6 +90,8 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN title TEXT DEFAULT ''",
             "ALTER TABLE jobs ADD COLUMN user_id TEXT DEFAULT ''",
             "ALTER TABLE jobs ADD COLUMN worker_pid INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN google_sub TEXT",
+            "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
         ):
             try:
                 conn.execute(stmt)
@@ -96,6 +100,10 @@ def init_db() -> None:
                 pass  # column already exists
         # Index on user_id (must run after the column migration above)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub "
+            "ON users(google_sub) WHERE google_sub IS NOT NULL AND google_sub != ''"
+        )
     finally:
         conn.close()
 
@@ -477,6 +485,8 @@ def _user_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         d["settings"] = {}
     d["is_admin"] = bool(d["is_admin"])
     d["is_active"] = bool(d["is_active"])
+    d["google_sub"] = d.get("google_sub") or ""
+    d["email"] = d.get("email") or ""
     return d
 
 
@@ -485,17 +495,20 @@ def create_user(
     user_id: str,
     username: str,
     password_hash: str,
+    google_sub: str | None = None,
+    email: str = "",
 ) -> dict[str, Any] | None:
     """Insert a new user.  Returns the user dict, or None if the username is taken."""
     now = time.time()
+    sub = (google_sub or "").strip() or None
     conn = _connect()
     try:
         try:
             conn.execute(
-                """INSERT INTO users (id, username, password_hash, is_admin, is_active,
-                   settings, created_at)
-                   VALUES (?, ?, ?, 0, 1, '{}', ?)""",
-                (user_id, username, password_hash, now),
+                """INSERT INTO users (id, username, password_hash, google_sub, email,
+                   is_admin, is_active, settings, created_at)
+                   VALUES (?, ?, ?, ?, ?, 0, 1, '{}', ?)""",
+                (user_id, username, password_hash, sub, email.strip(), now),
             )
         except sqlite3.IntegrityError:
             return None
@@ -523,6 +536,18 @@ def get_user_by_username(username: str) -> dict[str, Any] | None:
     conn = _connect()
     try:
         row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        return _user_row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_user_by_google_sub(google_sub: str) -> dict[str, Any] | None:
+    sub = (google_sub or "").strip()
+    if not sub:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE google_sub = ?", (sub,)).fetchone()
         return _user_row_to_dict(row) if row else None
     finally:
         conn.close()
@@ -556,6 +581,7 @@ def update_user(
     last_login_at: float | None = None,
     failed_attempts: int | None = None,
     locked_until: float | None = None,
+    email: str | None = None,
 ) -> None:
     """Update one or more fields of a user."""
     conn = _connect()
@@ -570,6 +596,7 @@ def update_user(
             ("last_login_at", last_login_at),
             ("failed_attempts", failed_attempts),
             ("locked_until", locked_until),
+            ("email", email),
         ):
             if val is not None:
                 sets.append(f"{col} = ?")

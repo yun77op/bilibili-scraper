@@ -1,5 +1,5 @@
 // 登录页入口（ESM）
-import { createApp, ref } from "/static/vendor/vue/vue.esm-browser.prod.js";
+import { createApp, onMounted, ref } from "/static/vendor/vue/vue.esm-browser.prod.js";
 
 const App = {
   setup() {
@@ -7,6 +7,20 @@ const App = {
     const password = ref("");
     const error = ref("");
     const busy = ref(false);
+    const googleEnabled = ref(false);
+
+    onMounted(async () => {
+      const params = new URLSearchParams(location.search);
+      const fromGoogle = params.get("error");
+      if (fromGoogle) error.value = fromGoogle;
+      try {
+        const resp = await fetch("/api/auth/google/status");
+        const data = await resp.json();
+        googleEnabled.value = Boolean(data.enabled);
+      } catch {
+        googleEnabled.value = false;
+      }
+    });
 
     async function submit() {
       error.value = "";
@@ -32,7 +46,7 @@ const App = {
       busy.value = false;
     }
 
-    return { username, password, error, busy, submit };
+    return { username, password, error, busy, googleEnabled, submit };
   },
 };
 

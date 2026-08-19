@@ -10,6 +10,7 @@
 ## 用户体系
 
 - 开放注册，密码使用 scrypt 哈希存储；登录失败 5 次锁定 15 分钟
+- 支持 **Google 账号一键登录/注册**（首次 Google 登录自动建号；与用户名密码并存）
 - **第一个注册的用户自动成为管理员**，并可看到旧数据（升级前已有任务自动归入管理员）
 - 每个用户只能看到、操作自己的任务；文章可在线查看、复制、下载（MD / HTML / PDF），或上传到自己的 Google Drive
 - 设置页（`/settings`）为独立页面：Google Drive 授权与上传偏好、YouTube Cookie 为每用户设置；DeepSeek / Whisper 等全局配置仅管理员可见
@@ -107,6 +108,26 @@ FLASK_SECRET_KEY=    # 会话签名密钥；不填则首次启动自动生成并
 
 配置了 `GROQ_API_KEY` 后，无字幕视频会走 Groq Whisper（默认 `whisper-large-v3-turbo`），失败则回退到本地 faster-whisper。强制本地转写可设 `TRANSCRIBE_PROVIDER=local`。
 
+### Google 登录（可选）
+
+配置后登录/注册页会出现「使用 Google 账号登录」。凭据优先级：
+
+1. 环境变量 `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`
+2. `GOOGLE_CREDENTIALS_PATH` 指向的 OAuth 客户端 JSON
+3. 与 Google Drive 共用的 `.gdrive-credentials.json`（或 `GDRIVE_CREDENTIALS_PATH`）
+
+在 Google Cloud Console → 凭据 → OAuth 客户端 ID（**Web 应用**，桌面应用无法用于公网域名）的 **「授权重定向 URI」** 中增加：
+
+```
+https://bilibili-scraper.shuilong.uk/api/auth/google/callback
+```
+
+本机调试可用 `http://127.0.0.1:8085/api/auth/google/callback`。Google 对非 localhost 地址要求 HTTPS。OAuth 同意屏幕需包含 `openid`、`email`、`profile`（非敏感 scope）。
+
+生产环境在 `.env.local` 设置 `PUBLIC_BASE_URL=https://bilibili-scraper.shuilong.uk`，确保回调地址不随反代头变化。
+
+未配置凭据时不显示 Google 按钮，用户名密码方式不受影响。用 Google 注册的账号没有登录密码，请继续用 Google 进入。
+
 ### Whisper 模型
 
 首次运行时会自动从 HuggingFace 下载 Whisper 模型到项目内的 `models/` 目录，避免写入用户目录时权限不足。默认使用 `faster-whisper-base`，可通过 `WHISPER_MODEL` 环境变量切换（如 `small`、`medium`、`large-v3`）。
@@ -161,7 +182,7 @@ $env:YOUTUBE_COOKIES_FILE="C:\path\to\youtube-cookies.txt"
 1. 放置 OAuth 客户端凭据：从 Google Cloud Console 下载 OAuth 2.0 客户端 JSON，保存为项目内 `.gdrive-credentials.json`（所有用户共用这份客户端；也可用环境变量 `GDRIVE_CREDENTIALS_PATH` 指定其它路径，旧路径 `~/.gdrive-credentials.json` 仍兼容）。每个用户的授权 token 存入数据库 `jobs.db` 的 `gdrive_tokens` 表（按 user_id 分开）；旧的 `.gdrive-tokens/` 文件会在首次使用时自动迁移进数据库并删除
 2. 客户端类型注意（选择错误会在授权时报 `redirect_uri_mismatch`）：
    - 仅本机 / SSH 隧道（localhost 访问）→ 下载**「桌面应用」**类型即可
-   - 用户通过**局域网 IP 或域名**访问 → 必须用**「Web 应用」**类型，并在 Google Cloud Console → 凭据 → OAuth 客户端 ID → **「授权重定向 URI」**中添加 `http(s)://你的访问地址/api/gdrive/callback`（例如 `http://192.168.1.10:8085/api/gdrive/callback`）
+   - 用户通过**局域网 IP 或域名**访问 → 必须用**「Web 应用」**类型，并在 **「授权重定向 URI」**中添加 `http(s)://你的访问地址/api/gdrive/callback`（Drive）以及 `http(s)://你的访问地址/api/auth/google/callback`（Google 登录，若启用）
    - OAuth 同意屏幕需设为**「生产环境」**，否则非测试用户无法授权
 3. 每个用户在设置页点击「授权 Google Drive」完成自己的 OAuth 授权
 4. 设置上传开关、目标文件夹（名称或 ID）、格式（HTML / PDF）与是否按日期分目录；处理完成自动上传，也可在任务列表点 ☁️ 手动上传
@@ -229,7 +250,7 @@ PORT=8080 ./stop.sh
 
 ## 对外部署
 
-- 建议部署在公网服务器（Linux），用 Nginx / Caddy 等反代到 8085 端口并启用 HTTPS（登录 Cookie 自动带 `Secure` 标志）
+- 建议部署在公网服务器（Linux），用 Nginx / Caddy 等反代到 8085 端口并启用 HTTPS（登录 Cookie 自动带 `Secure` 标志）。反代请转发 `X-Forwarded-Proto` / `X-Forwarded-Host`，以便 Google 登录回调地址为 https
 - 首页 `/` 为公开落地页（无需登录），适合直接对外宣传；应用工作台在 `/app`，需登录后才可访问
 - 生产环境建议多线程：`python server.py --host 0.0.0.0 --port 8085 --threads 8`
 - 管理员可在设置页底部查看 DeepSeek / Whisper / Worker 状态，并禁用恶意用户
