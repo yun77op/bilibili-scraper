@@ -1,7 +1,7 @@
 // 任务条目组件：状态徽章、展开详情（HTML/转写稿/日志 tab）、操作按钮
 // 展开状态与 tab 是组件内部状态，列表刷新时 Vue 按 :key 保留实例，不重建
-import { api, toast } from "/static/common.js";
-import { sanitizeMarkdown, renderRich } from "/static/markdown.js";
+import { api, toast } from "/static/common.js?v=20260819t2";
+import { sanitizeMarkdown, renderRich } from "/static/markdown.js?v=20260819t2";
 
 const BADGE_MAP = {
   queued: ["排队中", "badge-queued"],
@@ -310,21 +310,25 @@ export default {
     async uploadNotion() {
       if (this.busy) return;
       this.busy = "notion";
+      const pending = toast("正在写入 Notion…", { timeout: 0 });
       try {
         const resp = await api(`/api/jobs/${this.job.id}/save-notion`, { method: "POST" });
         const data = await resp.json();
+        pending.close();
         if (resp.ok && data.ok) {
           const n = Number(data.count) || (data.links || []).length || 1;
           toast(n > 1 ? `已写入 Notion（${n} 页）` : "已写入 Notion", {
             href: (data.links && data.links[0]) || "",
             hrefLabel: "打开",
+            timeout: 8000,
           });
           this.$emit("refresh");
         } else {
-          toast(data.error || "写入 Notion 失败", { type: "err", timeout: 6000 });
+          toast(data.error || "写入 Notion 失败", { type: "err", timeout: 8000 });
         }
       } catch {
-        toast("请求失败，请检查服务是否运行", { type: "err", timeout: 6000 });
+        pending.close();
+        toast("请求失败，请检查服务是否运行", { type: "err", timeout: 8000 });
       } finally {
         this.busy = null;
       }

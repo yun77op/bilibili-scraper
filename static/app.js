@@ -1,7 +1,7 @@
 // 首页入口（ESM）：表单提交、状态区、Worker 轮询、任务列表与分页
 import { createApp, reactive, ref, computed, onMounted, onUnmounted } from "/static/vendor/vue/vue.esm-browser.prod.js";
-import { api, Navbar } from "/static/common.js";
-import JobItem from "/static/components/job-item.js";
+import { api, Navbar } from "/static/common.js?v=20260819t2";
+import JobItem from "/static/components/job-item.js?v=20260819t2";
 
 const App = {
   components: { Navbar, JobItem },

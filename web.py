@@ -71,6 +71,13 @@ def create_app() -> Flask:
     # 反代 HTTPS 时用 X-Forwarded-Proto / Host 生成正确的 OAuth 回调地址
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
+    @app.after_request
+    def _no_store_frontend_assets(resp):
+        path = request.path or ""
+        if path.startswith("/static/") and path.endswith((".js", ".css", ".mjs")):
+            resp.headers["Cache-Control"] = "no-store, max-age=0"
+        return resp
+
     # ------------------------------------------------------------------
     # Pages
     # ------------------------------------------------------------------

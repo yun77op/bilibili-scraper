@@ -49,6 +49,8 @@ export function toast(message, { type = "ok", timeout = 3600, href, hrefLabel } 
     el.appendChild(a);
   }
   const close = () => {
+    if (el._closed) return;
+    el._closed = true;
     el.classList.add("toast-out");
     window.setTimeout(() => el.remove(), 180);
   };
@@ -58,6 +60,7 @@ export function toast(message, { type = "ok", timeout = 3600, href, hrefLabel } 
   });
   toastHost().appendChild(el);
   if (timeout > 0) window.setTimeout(close, timeout);
+  el.close = close;
   return el;
 }
 

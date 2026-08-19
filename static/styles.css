@@ -1841,7 +1841,7 @@ pre:has(> code.language-mermaid) svg foreignObject p {
 
 .toast-host {
   position: fixed;
-  top: 20px;
+  top: 72px;
   right: 20px;
   z-index: 9999;
   display: flex;
