@@ -1,0 +1,14 @@
+---
+description: 本项目生产域名与 OAuth 回调地址
+alwaysApply: true
+---
+
+# 生产域名
+
+对外访问地址固定为 **https://bilibili-scraper.shuilong.uk**（不要写成「你的域名」占位）。
+
+- `PUBLIC_BASE_URL=https://bilibili-scraper.shuilong.uk`
+- Google 登录回调：`https://bilibili-scraper.shuilong.uk/api/auth/google/callback`
+- Notion OAuth 回调：`https://bilibili-scraper.shuilong.uk/api/notion/callback`
+
+文档、环境变量示例、OAuth 配置说明一律用上述地址。本机调试才用 `http://127.0.0.1:8085`。

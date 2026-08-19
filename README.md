@@ -1,6 +1,6 @@
 # 视频转文章
 
-带用户体系的 Web 服务：输入 Bilibili 或 YouTube 视频 URL，自动获取字幕或下载音频转写，再整理成文章。支持多用户注册登录、任务数据隔离、每用户独立授权 Google Drive 上传。
+带用户体系的 Web 服务：输入 Bilibili 或 YouTube 视频 URL，自动获取字幕或下载音频转写，再整理成文章。支持多用户注册登录、任务数据隔离、每用户独立把文章写入自己的 Notion。
 
 | 平台 | 实现方式 |
 |------|----------|
@@ -12,8 +12,8 @@
 - 开放注册，密码使用 scrypt 哈希存储；登录失败 5 次锁定 15 分钟
 - 支持 **Google 账号一键登录/注册**（首次 Google 登录自动建号；与用户名密码并存）
 - **第一个注册的用户自动成为管理员**，并可看到旧数据（升级前已有任务自动归入管理员）
-- 每个用户只能看到、操作自己的任务；文章可在线查看、复制、下载（MD / HTML / PDF），或上传到自己的 Google Drive
-- 设置页（`/settings`）为独立页面：Google Drive 授权与上传偏好、YouTube Cookie 为每用户设置；DeepSeek / Whisper 等全局配置仅管理员可见
+- 每个用户只能看到、操作自己的任务；文章可在线查看、复制、下载（MD / HTML / PDF），或写入自己的 Notion
+- 设置页（`/settings`）为独立页面：Notion Integration 与上传偏好、YouTube Cookie 为每用户设置；DeepSeek / Whisper 等全局配置仅管理员可见
 
 ## 准备环境
 
@@ -114,7 +114,7 @@ FLASK_SECRET_KEY=    # 会话签名密钥；不填则首次启动自动生成并
 
 1. 环境变量 `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`
 2. `GOOGLE_CREDENTIALS_PATH` 指向的 OAuth 客户端 JSON
-3. 与 Google Drive 共用的 `.gdrive-credentials.json`（或 `GDRIVE_CREDENTIALS_PATH`）
+3. 项目内 `.gdrive-credentials.json`（或 `GDRIVE_CREDENTIALS_PATH`；文件名沿用旧路径）
 
 在 Google Cloud Console → 凭据 → OAuth 客户端 ID（**Web 应用**，桌面应用无法用于公网域名）的 **「授权重定向 URI」** 中增加：
 
@@ -175,17 +175,35 @@ export YOUTUBE_COOKIES_FILE="/path/to/youtube-cookies.txt"
 $env:YOUTUBE_COOKIES_FILE="C:\path\to\youtube-cookies.txt"
 ```
 
-## Google Drive（可选，每用户独立）
+## Notion（可选，每用户独立）
 
-文章可自动或手动上传到 Google Drive：
+文章可自动或手动写成 Notion 子页面。每个用户走 **OAuth**，授权时自己勾选可访问的页面，**不会**申请整个工作区权限。
 
-1. 放置 OAuth 客户端凭据：从 Google Cloud Console 下载 OAuth 2.0 客户端 JSON，保存为项目内 `.gdrive-credentials.json`（所有用户共用这份客户端；也可用环境变量 `GDRIVE_CREDENTIALS_PATH` 指定其它路径，旧路径 `~/.gdrive-credentials.json` 仍兼容）。每个用户的授权 token 存入数据库 `jobs.db` 的 `gdrive_tokens` 表（按 user_id 分开）；旧的 `.gdrive-tokens/` 文件会在首次使用时自动迁移进数据库并删除
-2. 客户端类型注意（选择错误会在授权时报 `redirect_uri_mismatch`）：
-   - 仅本机 / SSH 隧道（localhost 访问）→ 下载**「桌面应用」**类型即可
-   - 用户通过**局域网 IP 或域名**访问 → 必须用**「Web 应用」**类型，并在 **「授权重定向 URI」**中添加 `http(s)://你的访问地址/api/gdrive/callback`（Drive）以及 `http(s)://你的访问地址/api/auth/google/callback`（Google 登录，若启用）
-   - OAuth 同意屏幕需设为**「生产环境」**，否则非测试用户无法授权
-3. 每个用户在设置页点击「授权 Google Drive」完成自己的 OAuth 授权
-4. 设置上传开关、目标文件夹（名称或 ID）、格式（HTML / PDF）与是否按日期分目录；处理完成自动上传，也可在任务列表点 ☁️ 手动上传
+服务端（管理员）先配置：
+
+1. 打开 [notion.so/my-integrations](https://www.notion.so/my-integrations) 创建 Integration，类型选 **Public**
+2. 在 Integration 的 **Redirect URIs** 中添加：
+
+```
+https://bilibili-scraper.shuilong.uk/api/notion/callback
+```
+
+本机调试可用 `http://127.0.0.1:8085/api/notion/callback`。
+
+3. 把 OAuth Client ID / Secret 写入 `.env.local`：
+
+```
+NOTION_CLIENT_ID=
+NOTION_CLIENT_SECRET=
+PUBLIC_BASE_URL=https://bilibili-scraper.shuilong.uk
+```
+
+每个用户在设置页：
+
+1. 点击「授权 Notion」，在弹窗中登录并勾选要写入的**父页面**（普通页面，不要选 Database）
+2. 把该页面链接填到「父页面」并保存；可选开启自动写入和按日期分子页面
+3. Access token 存入 `jobs.db` 的 `notion_tokens` 表（按 user_id 分开），接口不会回传给前端
+4. 处理完成会自动建页；也可在任务列表点 📝 手动写入。多分 P 任务按集各建一页
 
 ## 启动
 
@@ -236,7 +254,7 @@ PORT=8080 ./stop.sh
 
 - 📄 **文章 / 📝 转写稿**：在线查看 + 一键复制
 - **下载 MD / HTML / PDF**：浏览器直接下载（多分P任务自动打包为 zip）
-- ☁️ **上传到 Google Drive**：手动上传到自己的网盘
+- 📝 **写入 Notion**：手动写成你指定父页面下的子页面
 
 ## 知识库（RAG 问答）
 

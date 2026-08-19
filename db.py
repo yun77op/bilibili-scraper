@@ -72,9 +72,9 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at   REAL
 );
 
-CREATE TABLE IF NOT EXISTS gdrive_tokens (
+CREATE TABLE IF NOT EXISTS notion_tokens (
     user_id     TEXT PRIMARY KEY,
-    token_json  TEXT NOT NULL,
+    token       TEXT NOT NULL,
     updated_at  REAL
 );
 """
@@ -698,41 +698,41 @@ def delete_job(job_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Google Drive tokens (per-user, stored in DB)
+# Notion tokens (per-user OAuth access token JSON)
 # ---------------------------------------------------------------------------
 
-def get_gdrive_token(user_id: str) -> str | None:
-    """Return the stored Google Drive token JSON for a user, or None."""
+def get_notion_token(user_id: str) -> str | None:
+    """Return the stored Notion integration token for a user, or None."""
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT token_json FROM gdrive_tokens WHERE user_id = ?",
+            "SELECT token FROM notion_tokens WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        return row["token_json"] if row else None
+        return row["token"] if row else None
     finally:
         conn.close()
 
 
-def save_gdrive_token(user_id: str, token_json: str) -> None:
-    """Insert or replace the Google Drive token JSON for a user."""
+def save_notion_token(user_id: str, token: str) -> None:
+    """Insert or replace the Notion integration token for a user."""
     conn = _connect()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO gdrive_tokens (user_id, token_json, updated_at) "
+            "INSERT OR REPLACE INTO notion_tokens (user_id, token, updated_at) "
             "VALUES (?, ?, ?)",
-            (user_id, token_json, time.time()),
+            (user_id, token, time.time()),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def delete_gdrive_token(user_id: str) -> None:
-    """Delete the stored Google Drive token for a user (e.g. revoke)."""
+def delete_notion_token(user_id: str) -> None:
+    """Delete the stored Notion token for a user."""
     conn = _connect()
     try:
-        conn.execute("DELETE FROM gdrive_tokens WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM notion_tokens WHERE user_id = ?", (user_id,))
         conn.commit()
     finally:
         conn.close()

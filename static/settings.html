@@ -15,7 +15,7 @@
           <header class="topbar">
             <div>
               <h1>设置</h1>
-              <p>管理你的 Google Drive 上传与 YouTube 鉴权。</p>
+              <p>管理你的 Notion 上传与 YouTube 鉴权。</p>
             </div>
             <div class="topbar-right">
               <div class="status-pill">{{ saveStatus }}</div>
@@ -24,40 +24,45 @@
 
           <section class="config-section">
             <div class="config-head">
-              <h3>☁️ Google Drive 上传</h3>
-              <button class="ghost" type="button" :disabled="saving" @click="save">保存设置</button>
+              <h3>📝 Notion 上传</h3>
+              <button class="ghost" type="button" :disabled="saving" @click="save()">保存设置</button>
             </div>
             <div class="config-body">
               <div class="channel-group">
                 <label class="auto-save-label">
-                  <input type="checkbox" v-model="gdriveEnabled" />
-                  处理完成后自动上传到 Google Drive
+                  <input type="checkbox" v-model="notionEnabled" />
+                  处理完成后自动写入 Notion
                 </label>
-                <div class="gdrive-detail" :class="{ visible: gdriveEnabled }">
+                <div class="notion-detail visible">
                   <input
                     type="text"
-                    v-model="gdriveFolder"
-                    placeholder="文件夹名称或 ID（如 bilibili文章，留空上传到根目录）"
+                    v-model="notionParent"
+                    placeholder="父页面链接或 ID（文章会建为该页面的子页面）"
                     autocomplete="off"
                   />
-                  <div class="gdrive-format-row">
-                    <label>上传格式：</label>
-                    <select v-model="gdriveFormat">
-                      <option value="html">HTML（手机阅读）</option>
-                      <option value="pdf">PDF（打印/归档）</option>
-                    </select>
-                  </div>
                   <label class="auto-save-label">
                     <input type="checkbox" v-model="dateSubdir" />
-                    按日期分目录（YYYYMMDD 子文件夹）
+                    按日期分子页面（YYYYMMDD）
                   </label>
-                  <div class="gdrive-auth-row">
-                    <span class="cookie-status">{{ gdriveStatusText }}</span>
-                    <button type="button" class="ghost" :disabled="gdriveBusy" @click="gdriveAuth">
-                      {{ gdriveAuthBtnText }}
+                  <div class="notion-auth-row">
+                    <span class="cookie-status">{{ notionStatusText }}</span>
+                    <button type="button" class="ghost" :disabled="notionBusy" @click="notionAuth">
+                      {{ notionAuthBtnText }}
                     </button>
+                    <button
+                      type="button"
+                      class="ghost"
+                      v-if="notionConfigured"
+                      :disabled="notionBusy"
+                      @click="disconnect"
+                    >取消授权</button>
                   </div>
                 </div>
+                <p class="hint">
+                  点击「授权 Notion」后，在弹出窗口里登录并<strong>勾选要写入的父页面</strong>。
+                  Notion 只会开放你勾选的页面，不会拿到整个工作区权限。
+                  授权完成后把该页面链接填到上面并保存。
+                </p>
               </div>
             </div>
           </section>

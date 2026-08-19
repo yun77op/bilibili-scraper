@@ -34,13 +34,14 @@ from app import (
     load_config,
     save_config,
     transcribe_provider,
-    upload_job_to_drive,
+    upload_job_to_notion,
     write_article_html,
 )
-from gdrive_uploader import (
-    exchange_code as gdrive_exchange_code,
-    get_auth_url as gdrive_get_auth_url,
-    is_authenticated as gdrive_is_authenticated,
+from notion_uploader import (
+    auth_status as notion_auth_status,
+    exchange_code as notion_exchange_code,
+    get_auth_url as notion_get_auth_url,
+    parse_page_id as notion_parse_page_id,
 )
 
 # Login/register throttling (per IP, in-memory)
@@ -106,6 +107,14 @@ def create_app() -> Flask:
         if auth.current_user():
             return redirect(url_for("workspace"))
         return send_file(STATIC_DIR / "register.html", mimetype="text/html; charset=utf-8")
+
+    @app.get("/privacy")
+    def privacy_page():
+        return send_file(STATIC_DIR / "privacy.html", mimetype="text/html; charset=utf-8")
+
+    @app.get("/terms")
+    def terms_page():
+        return send_file(STATIC_DIR / "terms.html", mimetype="text/html; charset=utf-8")
 
     # ------------------------------------------------------------------
     # Auth API
@@ -224,19 +233,20 @@ def create_app() -> Flask:
         user = auth.current_user()
         settings = user["settings"]
         try:
-            gdrive_authed = gdrive_is_authenticated(user["id"])
+            status = notion_auth_status(user["id"])
         except Exception:
-            gdrive_authed = False
+            status = {"authenticated": False, "workspace": "", "oauth_ready": False}
         return jsonify({
             "user": {"username": user["username"], "is_admin": user["is_admin"]},
             "settings": {
-                "gdrive_enabled": bool(settings.get("gdrive_enabled")),
-                "gdrive_folder_id": str(settings.get("gdrive_folder_id", "")).strip(),
-                "gdrive_format": str(settings.get("gdrive_format", "html")).strip() or "html",
+                "notion_enabled": bool(settings.get("notion_enabled")),
+                "notion_parent_page_id": str(settings.get("notion_parent_page_id", "")).strip(),
                 "date_subdir": bool(settings.get("date_subdir")),
                 "youtube_cookie_configured": bool(str(settings.get("youtube_cookie", "")).strip()),
             },
-            "gdrive_authenticated": gdrive_authed,
+            "notion_configured": status["authenticated"],
+            "notion_workspace": status["workspace"],
+            "notion_oauth_ready": status["oauth_ready"],
             "deepseek_configured": bool(os.getenv("DEEPSEEK_API_KEY", "").strip()),
             "deepseek_model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
             "whisper_device": os.getenv("WHISPER_DEVICE", "auto"),
@@ -252,13 +262,12 @@ def create_app() -> Flask:
         user = auth.current_user()
         data = request.get_json(silent=True) or {}
         settings = dict(user["settings"] or {})
-        if "gdrive_enabled" in data:
-            settings["gdrive_enabled"] = bool(data["gdrive_enabled"])
-        if "gdrive_folder_id" in data:
-            settings["gdrive_folder_id"] = str(data.get("gdrive_folder_id", "")).strip()
-        if "gdrive_format" in data:
-            fmt = str(data.get("gdrive_format", "html")).strip().lower()
-            settings["gdrive_format"] = fmt if fmt in ("html", "pdf") else "html"
+        if "notion_enabled" in data:
+            settings["notion_enabled"] = bool(data["notion_enabled"])
+        if "notion_parent_page_id" in data:
+            raw_parent = str(data.get("notion_parent_page_id", "")).strip()
+            parsed = notion_parse_page_id(raw_parent)
+            settings["notion_parent_page_id"] = parsed or raw_parent
         if "date_subdir" in data:
             settings["date_subdir"] = bool(data["date_subdir"])
         if "youtube_cookie" in data:
@@ -345,12 +354,12 @@ def create_app() -> Flask:
             return jsonify({"error": "任务不存在或状态不允许重试"}), 400
         return jsonify({"ok": True, "id": job_id})
 
-    @app.post("/api/jobs/<job_id>/save-drive")
+    @app.post("/api/jobs/<job_id>/save-notion")
     @auth.login_required
-    def api_save_drive(job_id: str):
+    def api_save_notion(job_id: str):
         user = auth.current_user()
         try:
-            return jsonify(upload_job_to_drive(job_id, user["id"]))
+            return jsonify(upload_job_to_notion(job_id, user["id"]))
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 400
 
@@ -386,46 +395,57 @@ def create_app() -> Flask:
                         headers={"Content-Disposition": disposition})
 
     # ------------------------------------------------------------------
-    # Google Drive (per-user)
+    # Notion OAuth (per-user)
     # ------------------------------------------------------------------
 
-    @app.get("/api/gdrive/status")
+    @app.get("/api/notion/status")
     @auth.login_required
-    def api_gdrive_status():
+    def api_notion_status():
         user = auth.current_user()
         try:
-            authed = gdrive_is_authenticated(user["id"])
+            return jsonify(notion_auth_status(user["id"]))
         except Exception:
-            authed = False
-        return jsonify({"authenticated": authed})
+            return jsonify({"authenticated": False, "workspace": "", "oauth_ready": False})
 
-    @app.post("/api/gdrive/auth-url")
+    @app.post("/api/notion/auth-url")
     @auth.login_required
-    def api_gdrive_auth_url():
+    def api_notion_auth_url():
         try:
-            redirect_uri = _public_base_url() + "/api/gdrive/callback"
-            auth_url, state = gdrive_get_auth_url(redirect_uri)
-            session["gdrive_state"] = state
+            redirect_uri = _public_base_url() + "/api/notion/callback"
+            auth_url, state = notion_get_auth_url(redirect_uri)
+            session["notion_oauth_state"] = state
+            session["notion_oauth_redirect"] = redirect_uri
             return jsonify({"url": auth_url, "state": state})
         except FileNotFoundError as exc:
-            return jsonify({"error": str(exc)}), 400
-        except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         except Exception as exc:
             return jsonify({"error": f"生成授权链接失败：{exc}"}), 500
 
-    @app.get("/api/gdrive/callback")
-    def api_gdrive_callback():
+    @app.get("/api/notion/callback")
+    def api_notion_callback():
         user = auth.current_user()
+        if request.args.get("error"):
+            desc = request.args.get("error_description") or request.args.get("error") or "授权被取消"
+            return _html_page("授权失败", desc)
         code = request.args.get("code", "")
         state = request.args.get("state", "")
         if not code:
-            return _html_page("授权失败", "未收到 Google 的授权码，请重试。")
-        if user is None or session.get("gdrive_state") != state:
+            return _html_page("授权失败", "未收到 Notion 的授权码，请重试。")
+        if user is None or session.get("notion_oauth_state") != state:
             return _html_page("授权失败", "授权会话已失效，请回到设置页重新发起授权。")
-        session.pop("gdrive_state", None)
-        success, message = gdrive_exchange_code(code, state, user["id"])
+        redirect_uri = session.pop("notion_oauth_redirect", None) or (
+            _public_base_url() + "/api/notion/callback"
+        )
+        session.pop("notion_oauth_state", None)
+        success, message = notion_exchange_code(code, redirect_uri, user["id"])
         return _html_page("授权成功" if success else "授权失败", message, auto_close=success)
+
+    @app.post("/api/notion/disconnect")
+    @auth.login_required
+    def api_notion_disconnect():
+        user = auth.current_user()
+        _db.delete_notion_token(user["id"])
+        return jsonify({"ok": True})
 
     # ------------------------------------------------------------------
     # YouTube login (server-side browser; for local deployment)

@@ -37,7 +37,7 @@ export default {
       expanded: false,
       activeTab: "html", // 默认展示渲染后的 HTML（不展示 markdown 原文）
       activePage: 0, // 合集任务当前查看的篇目（0-based）
-      busy: null, // retry | cancel | delete | drive
+      busy: null, // retry | cancel | delete | notion
       htmlContent: null, // HTML 渲染结果（懒渲染缓存）
       htmlRenderedFor: null, // 已渲染的文章内容，列表轮询内容不变时不重渲
       readerOpen: false, // 阅读模式弹窗是否打开
@@ -307,11 +307,11 @@ export default {
         this.busy = null;
       }
     },
-    async uploadDrive() {
+    async uploadNotion() {
       if (this.busy) return;
-      this.busy = "drive";
+      this.busy = "notion";
       try {
-        const resp = await api(`/api/jobs/${this.job.id}/save-drive`, { method: "POST" });
+        const resp = await api(`/api/jobs/${this.job.id}/save-notion`, { method: "POST" });
         const data = await resp.json();
         if (resp.ok && data.ok) {
           this.$emit("refresh");
@@ -402,9 +402,9 @@ export default {
     >{{ busy === 'cancel' ? '…' : '✕' }}</button>
     <button
       v-if="job.status === 'done'"
-      class="job-drive-btn" title="上传到 Google Drive" :disabled="busy !== null"
-      @click="uploadDrive"
-    >{{ busy === 'drive' ? '…' : '☁️' }}</button>
+      class="job-notion-btn" title="写入 Notion" :disabled="busy !== null"
+      @click="uploadNotion"
+    >{{ busy === 'notion' ? '…' : '📝' }}</button>
     <button
       v-if="job.status === 'done' && currentArticle"
       class="job-read-btn" title="阅读模式：弹窗阅读文章"

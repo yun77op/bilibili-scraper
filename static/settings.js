@@ -1,4 +1,4 @@
-// 设置页入口（ESM）：配置加载/保存、Google Drive 授权、YouTube 登录、管理员区
+// 设置页入口（ESM）：配置加载/保存、Notion OAuth、YouTube 登录、管理员区
 import { createApp, ref, onMounted } from "/static/vendor/vue/vue.esm-browser.prod.js";
 import { api, Navbar } from "/static/common.js";
 
@@ -9,15 +9,16 @@ const App = {
     const saveStatus = ref("就绪");
     const saving = ref(false);
 
-    const gdriveEnabled = ref(false);
-    const gdriveFolder = ref("");
-    const gdriveFormat = ref("html");
+    const notionEnabled = ref(false);
+    const notionParent = ref("");
     const dateSubdir = ref(false);
     const youtubeCookie = ref("");
 
-    const gdriveStatusText = ref("检测中…");
-    const gdriveAuthBtnText = ref("授权 Google Drive");
-    const gdriveBusy = ref(false);
+    const notionConfigured = ref(false);
+    const notionOAuthReady = ref(false);
+    const notionStatusText = ref("检测中…");
+    const notionAuthBtnText = ref("授权 Notion");
+    const notionBusy = ref(false);
 
     const youtubeCookieStatusText = ref("未配置");
     const youtubeLoginStatusText = ref("");
@@ -33,9 +34,21 @@ const App = {
       return new Date(ts * 1000).toLocaleDateString();
     }
 
-    function updateGdriveStatus(authed) {
-      gdriveStatusText.value = authed ? "已授权 ✓" : "未授权";
-      gdriveAuthBtnText.value = authed ? "重新授权" : "授权 Google Drive";
+    function updateNotionStatus(authed, workspace, oauthReady) {
+      notionConfigured.value = Boolean(authed);
+      notionOAuthReady.value = oauthReady !== false;
+      if (!notionOAuthReady.value) {
+        notionStatusText.value = "服务端未配置 Notion OAuth";
+        notionAuthBtnText.value = "授权 Notion";
+        return;
+      }
+      if (authed) {
+        notionStatusText.value = workspace ? `已授权 ✓（${workspace}）` : "已授权 ✓";
+        notionAuthBtnText.value = "重新授权";
+      } else {
+        notionStatusText.value = "未授权";
+        notionAuthBtnText.value = "授权 Notion";
+      }
     }
 
     async function loadConfig() {
@@ -43,11 +56,10 @@ const App = {
       const cfg = await resp.json();
       const s = cfg.settings || {};
 
-      gdriveEnabled.value = Boolean(s.gdrive_enabled);
-      gdriveFolder.value = s.gdrive_folder_id || "";
-      gdriveFormat.value = s.gdrive_format || "html";
+      notionEnabled.value = Boolean(s.notion_enabled);
+      notionParent.value = s.notion_parent_page_id || "";
       dateSubdir.value = Boolean(s.date_subdir);
-      updateGdriveStatus(cfg.gdrive_authenticated);
+      updateNotionStatus(cfg.notion_configured, cfg.notion_workspace, cfg.notion_oauth_ready);
       youtubeCookieStatusText.value = s.youtube_cookie_configured ? "已配置" : "未配置";
 
       // 管理员区块
@@ -70,9 +82,8 @@ const App = {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            gdrive_enabled: gdriveEnabled.value,
-            gdrive_folder_id: gdriveFolder.value.trim(),
-            gdrive_format: gdriveFormat.value,
+            notion_enabled: notionEnabled.value,
+            notion_parent_page_id: notionParent.value.trim(),
             date_subdir: dateSubdir.value,
             youtube_cookie: youtubeCookie.value.trim(),
           }),
@@ -94,55 +105,63 @@ const App = {
       setTimeout(() => { saveStatus.value = "就绪"; }, 2000);
     }
 
-    // ── Google Drive 授权（弹窗 + 轮询关闭 + 5 分钟超时）──
-    async function gdriveAuth() {
-      if (gdriveBusy.value) return;
-      gdriveBusy.value = true;
-      gdriveStatusText.value = "正在生成授权链接…";
+    // ── Notion OAuth（弹窗 + 轮询关闭 + 5 分钟超时）──
+    async function notionAuth() {
+      if (notionBusy.value) return;
+      notionBusy.value = true;
+      notionStatusText.value = "正在生成授权链接…";
       try {
-        const resp = await api("/api/gdrive/auth-url", { method: "POST" });
+        const resp = await api("/api/notion/auth-url", { method: "POST" });
         const data = await resp.json();
         if (data.error) {
-          gdriveStatusText.value = "失败: " + data.error;
-          gdriveBusy.value = false;
+          notionStatusText.value = "失败: " + data.error;
+          notionBusy.value = false;
           return;
         }
-        gdriveStatusText.value = "请在弹出窗口中完成授权…";
-        const popup = window.open(data.url, "gdrive-auth", "width=600,height=700");
+        notionStatusText.value = "请在弹出窗口中完成授权…";
+        const popup = window.open(data.url, "notion-auth", "width=600,height=700");
         if (!popup) {
-          gdriveStatusText.value = "请允许弹窗，或手动打开授权链接";
-          gdriveBusy.value = false;
+          notionStatusText.value = "请允许弹窗，或手动打开授权链接";
+          notionBusy.value = false;
           return;
         }
-        // 轮询弹窗关闭（成功授权后弹窗自动关闭）
         const checkInterval = setInterval(async () => {
           if (popup.closed) {
             clearInterval(checkInterval);
-            await checkGdriveStatus();
-            gdriveBusy.value = false;
+            await checkNotionStatus();
+            notionBusy.value = false;
           }
         }, 1000);
-        // 5 分钟超时
         setTimeout(() => {
           clearInterval(checkInterval);
           if (!popup.closed) popup.close();
-          checkGdriveStatus();
-          gdriveBusy.value = false;
+          checkNotionStatus();
+          notionBusy.value = false;
         }, 300000);
       } catch (err) {
-        gdriveStatusText.value = "请求失败: " + err.message;
-        gdriveBusy.value = false;
+        notionStatusText.value = "请求失败: " + err.message;
+        notionBusy.value = false;
       }
     }
 
-    async function checkGdriveStatus() {
+    async function checkNotionStatus() {
       try {
-        const resp = await api("/api/gdrive/status");
+        const resp = await api("/api/notion/status");
         const data = await resp.json();
-        updateGdriveStatus(data.authenticated);
+        updateNotionStatus(data.authenticated, data.workspace, data.oauth_ready);
         return data.authenticated;
       } catch {
         return false;
+      }
+    }
+
+    async function disconnect() {
+      if (!confirm("确定取消 Notion 授权？")) return;
+      try {
+        await api("/api/notion/disconnect", { method: "POST" });
+        await checkNotionStatus();
+      } catch {
+        // 保持当前状态
       }
     }
 
@@ -196,8 +215,9 @@ const App = {
 
     return {
       saveStatus, saving,
-      gdriveEnabled, gdriveFolder, gdriveFormat, dateSubdir, youtubeCookie,
-      gdriveStatusText, gdriveAuthBtnText, gdriveBusy, gdriveAuth,
+      notionEnabled, notionParent, dateSubdir, youtubeCookie,
+      notionConfigured, notionStatusText, notionAuthBtnText, notionBusy,
+      notionAuth, disconnect,
       youtubeCookieStatusText, youtubeLoginStatusText, youtubeBusy, youtubeLogin,
       isAdmin, serverInfo, users, fmtDate, toggleUser,
       save,

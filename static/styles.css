@@ -338,32 +338,13 @@ button.ghost:hover {
   opacity: 0.8;
 }
 
-.gdrive-detail {
+.notion-detail {
   display: none;
   gap: 8px;
 }
 
-.gdrive-detail.visible {
+.notion-detail.visible {
   display: grid;
-}
-
-.gdrive-format-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--text-secondary, #666);
-}
-
-.gdrive-format-row select {
-  flex: 1;
-  padding: 6px 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--panel);
-  color: var(--text);
-  font-size: 13px;
-  max-width: 200px;
 }
 
 .login-btn {
@@ -393,13 +374,13 @@ button.ghost:hover {
   cursor: not-allowed;
 }
 
-.gdrive-auth-row {
+.notion-auth-row {
   display: flex;
   align-items: center;
   gap: 12px;
 }
 
-.gdrive-auth-row .ghost {
+.notion-auth-row .ghost {
   min-height: 34px;
 }
 
@@ -632,7 +613,7 @@ button.ghost:hover {
   background: var(--danger);
 }
 
-.job-drive-btn,
+.job-notion-btn,
 .job-local-btn {
   width: 28px;
   height: 28px;
@@ -650,7 +631,7 @@ button.ghost:hover {
   transition: border-color .15s, color .15s, background .15s;
 }
 
-.job-drive-btn:hover,
+.job-notion-btn:hover,
 .job-local-btn:hover {
   border-color: var(--accent);
   color: var(--accent-strong);
@@ -1469,6 +1450,10 @@ pre:has(> code.language-mermaid) svg foreignObject p {
   color: var(--muted);
   line-height: 1.6;
   margin-top: 10px;
+}
+
+.hint a {
+  color: var(--accent-strong);
 }
 
 .server-info p {

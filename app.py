@@ -30,12 +30,9 @@ except ImportError:  # Windows
 import requests
 
 
-from gdrive_uploader import (
-    check_dependencies as gdrive_check_deps,
-    exchange_code as gdrive_exchange_code,
-    get_auth_url as gdrive_get_auth_url,
-    is_authenticated as gdrive_is_authenticated,
-    upload_file as gdrive_upload_file,
+from notion_uploader import (
+    create_article_page as notion_create_article_page,
+    is_configured as notion_is_configured,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -1465,7 +1462,7 @@ def _process_bilibili(job: Job) -> None:
             job.status = "done"
             job.log(f"复用缓存: {cached}", 100)
             job.log(job.build_summary())
-            _auto_gdrive_upload(job, cached)
+            _auto_notion_upload(job)
             return
 
     job._stage_begin()
@@ -1485,7 +1482,7 @@ def _process_bilibili(job: Job) -> None:
         job.log("任务完成", 100)
         job.log(job.build_summary())
         if job.output_dir:
-            _auto_gdrive_upload(job, Path(job.output_dir))
+            _auto_notion_upload(job)
     else:
         # Multiple pages — ?p=N means "start from episode N to the end"
         start_page = page_index if has_explicit_page else 0
@@ -1521,7 +1518,7 @@ def _process_bilibili(job: Job) -> None:
             all_output_dirs.append(Path(job.output_dir))
 
             # 处理完一集就立即上传，不等全部完成
-            _auto_gdrive_upload(job, Path(job.output_dir))
+            _auto_notion_upload(job)
 
         root_dir = Path(job.output_dir).parent if job.output_dir else OUTPUT_DIR
         if all_transcripts:
@@ -1681,73 +1678,46 @@ def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
     return audio_path
 
 
-def _auto_gdrive_upload(job: Job, out_dir: Path) -> None:
-    """Upload article (HTML or PDF) to the job owner's Google Drive if configured.
+def _auto_notion_upload(job: Job) -> None:
+    """Create a Notion page for the current article if the owner enabled it.
 
-    Upload preferences (enabled / folder / format / date subdir) come from the
-    user's own settings; credentials are per-user tokens.
+    Preferences (enabled / parent page / date subdir) come from the user's
+    settings; the OAuth access token is stored per-user in ``notion_tokens``.
     """
     settings = _user_settings(job.user_id)
-    if not settings.get("gdrive_enabled"):
+    if not settings.get("notion_enabled"):
+        return
+    if not str(job.article or "").strip():
         return
     try:
-        gdrive_format = str(settings.get("gdrive_format", "html")).strip().lower()
-        gdrive_folder = str(settings.get("gdrive_folder_id", "")).strip()
+        parent_page = str(settings.get("notion_parent_page_id", "")).strip()
         use_date_subdir = bool(settings.get("date_subdir"))
-        stem = out_dir.name
-
-        if gdrive_format == "html":
-            html_path = out_dir / f"{stem}.html"
-            if not html_path.exists():
-                write_article_html(job.article, html_path)
-            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, job.user_id)
-            if err:
-                return job.log(f"⚠️ Drive 上传失败：{err.get('message', '')}")
-            result = gdrive_upload_file(str(html_path), parent_folder_id=target_folder,
-                                        mime_type="text/html", user_id=job.user_id)
-        else:
-            pdf_path = out_dir / f"{stem}.pdf"
-            if not pdf_path.exists():
-                write_article_pdf(job.article, pdf_path)
-            target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, job.user_id)
-            if err:
-                return job.log(f"⚠️ Drive 上传失败：{err.get('message', '')}")
-            result = gdrive_upload_file(str(pdf_path), parent_folder_id=target_folder,
-                                        mime_type="application/pdf", user_id=job.user_id)
-
+        fallback_title = job.title or (Path(job.output_dir).name if job.output_dir else "")
+        article = repair_article_markdown(job.article)
+        result = notion_create_article_page(
+            markdown=article,
+            parent_page_id=parent_page,
+            user_id=job.user_id,
+            title=fallback_title,
+            date_subdir=use_date_subdir,
+        )
         if result.get("status") == "success":
             d = result["data"]
-            job.log(f"已上传到 Google Drive：{d['name']} ({d['webViewLink']})")
+            job.log(f"已写入 Notion：{d['title']} ({d['url']})")
         else:
-            job.log(f"⚠️ Drive 上传失败：{result.get('message', '')}")
+            job.log(f"⚠️ Notion 上传失败：{result.get('message', '')}")
     except Exception as exc:
-        job.log(f"⚠️ Drive 上传异常：{exc}")
+        job.log(f"⚠️ Notion 上传异常：{exc}")
 
 
 def _user_settings(user_id: str) -> dict[str, Any]:
-    """Return the user's settings dict (Drive / YouTube preferences), or {}."""
+    """Return the user's settings dict (Notion / YouTube preferences), or {}."""
     if not user_id:
         return {}
     user = _db.get_user(user_id)
     if not user:
         return {}
     return user.get("settings") or {}
-
-
-def _resolve_gdrive_folder(folder_id: str, date_subdir: bool,
-                           user_id: str = "") -> tuple[str, dict | None]:
-    """Resolve target folder ID, with optional date sub-directory."""
-    from gdrive_uploader import find_or_create_folder, _resolve_folder_id
-    target_folder, err = _resolve_folder_id(folder_id, user_id or None)
-    if err:
-        return "", err
-    if date_subdir:
-        date_name = time.strftime("%Y%m%d")
-        found_id, err = find_or_create_folder(date_name, target_folder or "", user_id=user_id or None)
-        if err:
-            return "", err
-        target_folder = found_id or folder_id
-    return target_folder or "", None
 
 
 def _process_youtube(job: Job) -> None:
@@ -1765,7 +1735,7 @@ def _process_youtube(job: Job) -> None:
         job.status = "done"
         job.log(f"复用缓存: {cached}", 100)
         job.log(job.build_summary())
-        _auto_gdrive_upload(job, cached)
+        _auto_notion_upload(job)
         return
 
     check_cancelled(job)
@@ -1813,8 +1783,7 @@ def _process_youtube(job: Job) -> None:
     job.log("任务完成", 100)
     job.log(job.build_summary())
 
-    # Upload to the owner's Google Drive if enabled
-    _auto_gdrive_upload(job, out_dir)
+    _auto_notion_upload(job)
 
 
 def _job_article_items(job: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1864,55 +1833,45 @@ def job_download_files(job: dict[str, Any], fmt: str = "md") -> list[tuple[str, 
     return payloads
 
 
-def upload_job_to_drive(job_id: str, user_id: str) -> dict[str, Any]:
-    """Upload a finished job's article(s) to the user's Google Drive
-    (HTML or PDF per the user's settings).  Handles multi-page jobs by
-    uploading every page."""
+def upload_job_to_notion(job_id: str, user_id: str) -> dict[str, Any]:
+    """Create Notion pages for a finished job's article(s).
+
+    Multi-page jobs become one Notion page per 分P.
+    """
     job = _db.get_user_job(user_id, job_id)
     if not job:
         raise RuntimeError("任务不存在")
     if job["status"] != "done" or not job["article"].strip():
         raise RuntimeError("文章尚未生成，无法上传")
     settings = _user_settings(user_id)
-    try:
-        authed = gdrive_is_authenticated(user_id)
-    except Exception:
-        authed = False
-    if not authed:
-        raise RuntimeError("Google Drive 未授权，请先在设置中完成授权")
-
-    gdrive_format = str(settings.get("gdrive_format", "html")).strip().lower()
-    gdrive_folder = str(settings.get("gdrive_folder_id", "")).strip()
+    if not notion_is_configured(user_id):
+        raise RuntimeError("尚未授权 Notion，请先到设置页完成授权")
+    parent_page = str(settings.get("notion_parent_page_id", "")).strip()
+    if not parent_page:
+        raise RuntimeError("尚未填写 Notion 父页面，请先到设置页保存页面链接")
     use_date_subdir = bool(settings.get("date_subdir"))
 
     links: list[str] = []
     for out_dir_item, art_item in _job_article_items(job):
         art_item = repair_article_markdown(art_item)
-        out_dir = Path(out_dir_item)
-        if not out_dir.name:
-            raise RuntimeError("任务缺少输出目录信息，无法上传")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stem = out_dir.name
-        if gdrive_format == "html":
-            file_path = out_dir / f"{stem}.html"
-            write_article_html(art_item, file_path)
-            mime_type = "text/html"
-        else:
-            file_path = out_dir / f"{stem}.pdf"
-            write_article_pdf(art_item, file_path)
-            mime_type = "application/pdf"
-
-        target_folder, err = _resolve_gdrive_folder(gdrive_folder, use_date_subdir, user_id)
-        if err:
-            raise RuntimeError(f"Drive 上传失败：{err.get('message', '')}")
-        result = gdrive_upload_file(str(file_path), parent_folder_id=target_folder,
-                                    mime_type=mime_type, user_id=user_id)
+        fallback_title = job.get("title") or Path(out_dir_item).name or ""
+        result = notion_create_article_page(
+            markdown=art_item,
+            parent_page_id=parent_page,
+            user_id=user_id,
+            title=fallback_title,
+            date_subdir=use_date_subdir,
+        )
         if result.get("status") != "success":
-            raise RuntimeError(f"Drive 上传失败：{result.get('message', '')}")
-        links.append(result["data"]["webViewLink"])
+            raise RuntimeError(f"Notion 上传失败：{result.get('message', '')}")
+        links.append(result["data"]["url"])
 
     try:
-        _db.update_job_log(job_id, f"已手动上传到 Google Drive（{len(links)} 个文件）：" + "、".join(links), 100)
+        _db.update_job_log(
+            job_id,
+            f"已手动写入 Notion（{len(links)} 页）：" + "、".join(links),
+            100,
+        )
     except Exception:
         pass
     return {"ok": True, "count": len(links), "links": links}
