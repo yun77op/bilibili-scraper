@@ -1,5 +1,5 @@
 // 设置页入口（ESM）：配置加载/保存、Notion OAuth、YouTube 登录、管理员区
-import { createApp, ref, onMounted } from "/static/vendor/vue/vue.esm-browser.prod.js";
+import { createApp, ref, computed, onMounted } from "/static/vendor/vue/vue.esm-browser.prod.js";
 import { api, Navbar } from "/static/common.js";
 
 const App = {
@@ -19,6 +19,13 @@ const App = {
     const notionStatusText = ref("检测中…");
     const notionAuthBtnText = ref("授权 Notion");
     const notionBusy = ref(false);
+    const notionPages = ref([]);
+
+    const notionPagePlaceholder = computed(() => {
+      if (!notionConfigured.value) return "请先授权 Notion";
+      if (!notionPages.value.length) return "未找到可写入的页面，请重新授权并勾选页面";
+      return "请选择写入页面";
+    });
 
     const youtubeCookieStatusText = ref("未配置");
     const youtubeLoginStatusText = ref("");
@@ -57,10 +64,11 @@ const App = {
       const s = cfg.settings || {};
 
       notionEnabled.value = Boolean(s.notion_enabled);
-      notionParent.value = s.notion_parent_page_id || "";
+      notionParent.value = (s.notion_parent_page_id || "").trim().toLowerCase();
       dateSubdir.value = Boolean(s.date_subdir);
       updateNotionStatus(cfg.notion_configured, cfg.notion_workspace, cfg.notion_oauth_ready);
       youtubeCookieStatusText.value = s.youtube_cookie_configured ? "已配置" : "未配置";
+      await loadNotionPages();
 
       // 管理员区块
       if (cfg.user && cfg.user.is_admin) {
@@ -149,9 +157,39 @@ const App = {
         const resp = await api("/api/notion/status");
         const data = await resp.json();
         updateNotionStatus(data.authenticated, data.workspace, data.oauth_ready);
+        await loadConfig();
         return data.authenticated;
       } catch {
         return false;
+      }
+    }
+
+    async function loadNotionPages() {
+      if (!notionConfigured.value) {
+        notionPages.value = [];
+        return;
+      }
+      try {
+        const resp = await api("/api/notion/pages");
+        const data = await resp.json();
+        const roots = data.roots || [];
+        const all = data.pages || [];
+        const byId = new Map();
+        for (const p of roots) {
+          if (p && p.id) byId.set(p.id, p);
+        }
+        const current = (notionParent.value || "").trim().toLowerCase();
+        if (current && !byId.has(current)) {
+          const extra = all.find((p) => p.id === current);
+          byId.set(current, extra || { id: current, title: "已保存的页面" });
+        }
+        notionPages.value = Array.from(byId.values());
+        if (!current && notionPages.value.length === 1) {
+          notionParent.value = notionPages.value[0].id;
+          await save();
+        }
+      } catch {
+        notionPages.value = [];
       }
     }
 
@@ -159,6 +197,7 @@ const App = {
       if (!confirm("确定取消 Notion 授权？")) return;
       try {
         await api("/api/notion/disconnect", { method: "POST" });
+        notionPages.value = [];
         await checkNotionStatus();
       } catch {
         // 保持当前状态
@@ -217,6 +256,7 @@ const App = {
       saveStatus, saving,
       notionEnabled, notionParent, dateSubdir, youtubeCookie,
       notionConfigured, notionStatusText, notionAuthBtnText, notionBusy,
+      notionPages, notionPagePlaceholder,
       notionAuth, disconnect,
       youtubeCookieStatusText, youtubeLoginStatusText, youtubeBusy, youtubeLogin,
       isAdmin, serverInfo, users, fmtDate, toggleUser,

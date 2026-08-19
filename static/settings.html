@@ -34,12 +34,18 @@
                   处理完成后自动写入 Notion
                 </label>
                 <div class="notion-detail visible">
-                  <input
-                    type="text"
+                  <select
                     v-model="notionParent"
-                    placeholder="父页面链接或 ID（文章会建为该页面的子页面）"
-                    autocomplete="off"
-                  />
+                    :disabled="!notionConfigured || notionBusy"
+                    @change="save()"
+                  >
+                    <option value="">{{ notionPagePlaceholder }}</option>
+                    <option
+                      v-for="p in notionPages"
+                      :key="p.id"
+                      :value="p.id"
+                    >{{ p.title }}</option>
+                  </select>
                   <label class="auto-save-label">
                     <input type="checkbox" v-model="dateSubdir" />
                     按日期分子页面（YYYYMMDD）
@@ -59,9 +65,9 @@
                   </div>
                 </div>
                 <p class="hint">
-                  点击「授权 Notion」后，在弹出窗口里登录并<strong>勾选要写入的父页面</strong>。
+                  点击「授权 Notion」后，在弹出窗口里登录并<strong>勾选要写入的页面</strong>。
+                  只勾选一个时会自动选中；勾了多个就在上面的列表里选一个作为文章存放位置。
                   Notion 只会开放你勾选的页面，不会拿到整个工作区权限。
-                  授权完成后把该页面链接填到上面并保存。
                 </p>
               </div>
             </div>

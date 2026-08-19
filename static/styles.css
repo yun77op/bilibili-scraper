@@ -30,7 +30,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -188,7 +189,8 @@ h1 {
   cursor: not-allowed;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 48px;
   border: 1px solid var(--line);
@@ -199,9 +201,15 @@ input {
   outline: none;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(13, 127, 118, 0.16);
+}
+
+select:disabled {
+  color: var(--muted);
+  background: #faf9f7;
 }
 
 .auto-save-label {

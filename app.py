@@ -1848,7 +1848,7 @@ def upload_job_to_notion(job_id: str, user_id: str) -> dict[str, Any]:
         raise RuntimeError("尚未授权 Notion，请先到设置页完成授权")
     parent_page = str(settings.get("notion_parent_page_id", "")).strip()
     if not parent_page:
-        raise RuntimeError("尚未填写 Notion 父页面，请先到设置页保存页面链接")
+        raise RuntimeError("尚未选择 Notion 写入页面，请先到设置页授权并选择页面")
     use_date_subdir = bool(settings.get("date_subdir"))
 
     links: list[str] = []

@@ -14,7 +14,7 @@ import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import unquote, urlencode
+from urllib.parse import quote, unquote, urlencode, urlsplit, urlunsplit
 
 import requests
 
@@ -225,6 +225,89 @@ def _token_for(user_id: str | None) -> str:
     return str(rec.get("access_token") or "").strip()
 
 
+def _page_title(page: dict[str, Any]) -> str:
+    props = page.get("properties") or {}
+    if not isinstance(props, dict):
+        return "无标题页面"
+    for prop in props.values():
+        if not isinstance(prop, dict) or prop.get("type") != "title":
+            continue
+        parts = prop.get("title") or []
+        text = "".join(
+            str(p.get("plain_text") or "") for p in parts if isinstance(p, dict)
+        ).strip()
+        if text:
+            return text[:200]
+    return "无标题页面"
+
+
+def _parent_ref_id(page: dict[str, Any]) -> str:
+    parent = page.get("parent") or {}
+    if not isinstance(parent, dict):
+        return ""
+    ptype = str(parent.get("type") or "").strip()
+    if ptype in ("page_id", "database_id", "block_id"):
+        return str(parent.get(ptype) or "").strip().lower()
+    return ""
+
+
+def list_accessible_pages(user_id: str) -> dict[str, Any]:
+    """List pages shared with this user's Notion connection.
+
+    Notion OAuth does not return the IDs the user ticked. After the token
+    exists, ``POST /v1/search`` is the supported way to discover them.
+
+    ``pages`` is every accessible page. ``roots`` are the likely OAuth
+    selections: workspace-level pages, or pages whose parent is not itself
+    in the accessible set (so created article children are filtered out).
+    """
+    token = _token_for(user_id)
+    if not token:
+        return {"pages": [], "roots": [], "error": None}
+
+    raw: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(5):
+        body: dict[str, Any] = {
+            "filter": {"property": "object", "value": "page"},
+            "page_size": 100,
+        }
+        if cursor:
+            body["start_cursor"] = cursor
+        data, err = _request("POST", "/search", token, json_body=body)
+        if err:
+            return {"pages": [], "roots": [], "error": err.get("message")}
+        for item in (data or {}).get("results") or []:
+            if item.get("object") != "page":
+                continue
+            pid = str(item.get("id") or "").strip().lower()
+            if not pid:
+                continue
+            raw.append({
+                "id": pid,
+                "title": _page_title(item),
+                "url": str(item.get("url") or "").strip(),
+                "parent_id": _parent_ref_id(item),
+                "parent_type": str((item.get("parent") or {}).get("type") or ""),
+            })
+        if not (data or {}).get("has_more"):
+            break
+        cursor = (data or {}).get("next_cursor")
+        if not cursor:
+            break
+
+    ids = {p["id"] for p in raw}
+    roots = [
+        p for p in raw
+        if p["parent_type"] == "workspace"
+        or not p["parent_id"]
+        or p["parent_id"] not in ids
+    ]
+    if not roots:
+        roots = list(raw)
+    return {"pages": raw, "roots": roots, "error": None}
+
+
 def _headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -314,8 +397,56 @@ def _chunks(text: str, limit: int = TEXT_LIMIT) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)]
 
 
+_ALLOWED_LINK_SCHEMES = {"http", "https", "mailto"}
+_MARKDOWN_TITLE_RE = re.compile(r"""^(\S+)(?:\s+["'(].*)?$""")
+_BARE_HOST_RE = re.compile(
+    r"^(?:www\.|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}(?::\d+)?(?:/|\?|#|$)"
+)
+
+
+def _normalize_notion_url(raw: str) -> str | None:
+    """Return a URL Notion will accept, or None to keep the text unlinked.
+
+    Article TOCs are ``[章节](#锚点)``; Notion rejects fragment-only and
+    other non-absolute links with ``Invalid URL for link``.
+    """
+    url = str(raw or "").strip()
+    if url.startswith("<") and url.endswith(">"):
+        url = url[1:-1].strip()
+    titled = _MARKDOWN_TITLE_RE.match(url)
+    if titled:
+        url = titled.group(1)
+    url = url.strip(" \t\"'")
+    if not url or url.startswith("#"):
+        return None
+    if url.startswith("//"):
+        url = "https:" + url
+    parsed = urlsplit(url)
+    if not parsed.scheme:
+        if _BARE_HOST_RE.match(url):
+            url = "https://" + url
+            parsed = urlsplit(url)
+        else:
+            return None
+    scheme = parsed.scheme.lower()
+    if scheme not in _ALLOWED_LINK_SCHEMES:
+        return None
+    if scheme in ("http", "https") and not parsed.netloc:
+        return None
+    try:
+        path = quote(parsed.path, safe="/:@-._~!$&'()*+,;=")
+        query = quote(parsed.query, safe="=&:@-._~!$'()*+,;/?")
+        fragment = quote(parsed.fragment, safe=":@-._~!$&'()*+,;=")
+    except Exception:
+        return None
+    rebuilt = urlunsplit((scheme, parsed.netloc, path, query, fragment))
+    if " " in rebuilt or len(rebuilt) > 2000:
+        return None
+    return rebuilt
+
+
 def _plain_rich(text: str, **annotations: Any) -> list[dict[str, Any]]:
-    link = annotations.pop("link", None)
+    link = _normalize_notion_url(str(annotations.pop("link", "") or ""))
     items: list[dict[str, Any]] = []
     for part in _chunks(text):
         item: dict[str, Any] = {"type": "text", "text": {"content": part}}
@@ -596,7 +727,7 @@ def create_article_page(
         return {
             "status": "error",
             "error": "missing_parent",
-            "message": "请填写 Notion 父页面链接或 ID，并把该页面连接给 Integration。",
+            "message": "请在设置页选择 Notion 写入页面（授权时勾选的那个）。",
         }
 
     page_title = extract_title(markdown, title)

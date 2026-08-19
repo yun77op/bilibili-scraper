@@ -41,6 +41,7 @@ from notion_uploader import (
     auth_status as notion_auth_status,
     exchange_code as notion_exchange_code,
     get_auth_url as notion_get_auth_url,
+    list_accessible_pages as notion_list_pages,
     parse_page_id as notion_parse_page_id,
 )
 
@@ -438,7 +439,27 @@ def create_app() -> Flask:
         )
         session.pop("notion_oauth_state", None)
         success, message = notion_exchange_code(code, redirect_uri, user["id"])
+        if success:
+            listed = notion_list_pages(user["id"])
+            roots = listed.get("roots") or []
+            row = _db.get_user(user["id"]) or user
+            settings = dict(row.get("settings") or {})
+            current = str(settings.get("notion_parent_page_id") or "").strip()
+            if not current and len(roots) == 1:
+                settings["notion_parent_page_id"] = roots[0]["id"]
+                _db.update_user(user["id"], settings=settings)
+                title = roots[0].get("title") or "未命名"
+                message = f"{message} 已自动选择页面「{title}」。"
         return _html_page("授权成功" if success else "授权失败", message, auto_close=success)
+
+    @app.get("/api/notion/pages")
+    @auth.login_required
+    def api_notion_pages():
+        user = auth.current_user()
+        try:
+            return jsonify(notion_list_pages(user["id"]))
+        except Exception as exc:
+            return jsonify({"pages": [], "roots": [], "error": str(exc)})
 
     @app.post("/api/notion/disconnect")
     @auth.login_required

@@ -115,6 +115,33 @@ class MarkdownToBlocksTest(unittest.TestCase):
         self.assertTrue(any(c == "重点" and a.get("bold") for c, a, _ in kinds))
         self.assertTrue(any(c == "链接" and link == {"url": "https://ex.com"} for c, _, link in kinds))
 
+    def _links(self, md: str) -> list[str | None]:
+        blocks = markdown_to_blocks(md)
+        urls: list[str | None] = []
+        for block in blocks:
+            payload = block.get(block.get("type")) or {}
+            for t in payload.get("rich_text") or []:
+                urls.append((t.get("text") or {}).get("link", {}).get("url") if (t.get("text") or {}).get("link") else None)
+        return urls
+
+    def test_toc_anchor_links_are_unlinked(self):
+        md = "- [引言](#引言)\n- [总结](#总结)"
+        blocks = markdown_to_blocks(md)
+        self.assertEqual([b["type"] for b in blocks], ["bulleted_list_item", "bulleted_list_item"])
+        for block in blocks:
+            for t in block["bulleted_list_item"]["rich_text"]:
+                self.assertIsNone((t.get("text") or {}).get("link"))
+        self.assertEqual(blocks[0]["bulleted_list_item"]["rich_text"][0]["text"]["content"], "引言")
+
+    def test_markdown_title_and_bare_host(self):
+        md = '[a](https://example.com "官网") 和 [b](www.bilibili.com/video/BV1xx)'
+        urls = [u for u in self._links(md) if u]
+        self.assertEqual(urls, ["https://example.com", "https://www.bilibili.com/video/BV1xx"])
+
+    def test_relative_and_empty_links_dropped(self):
+        md = "[空]() [相对](./foo.md) [BV](BV1xx411c7mY)"
+        self.assertFalse(any(self._links(md)))
+
     def test_heading_deeper_than_3_becomes_h3(self):
         self.assertEqual(self._types("#### 四级"), ["heading_3"])
 
@@ -257,6 +284,90 @@ class NotionOAuthTest(unittest.TestCase):
         db.save_notion_token("u1", "secret-legacy")
         self.assertEqual(_token_for("u1"), "secret-legacy")
         self.assertTrue(is_configured("u1"))
+
+
+class ListAccessiblePagesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / "jobs.db"
+        self.patcher = mock.patch.object(db, "DB_PATH", self.db_path)
+        self.patcher.start()
+        db.init_db()
+        db.save_notion_token("u1", "secret")
+
+    def tearDown(self):
+        self.patcher.stop()
+        self.tmp.cleanup()
+
+    def test_roots_exclude_children_of_accessible_pages(self):
+        parent_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        child_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        other_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+        def fake_request(method, path, token, json_body=None, params=None, timeout=30):
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/search")
+            return {
+                "results": [
+                    {
+                        "object": "page",
+                        "id": parent_id,
+                        "url": "https://notion.so/" + parent_id,
+                        "parent": {"type": "workspace", "workspace": True},
+                        "properties": {
+                            "title": {
+                                "type": "title",
+                                "title": [{"plain_text": "知识库"}],
+                            }
+                        },
+                    },
+                    {
+                        "object": "page",
+                        "id": child_id,
+                        "parent": {"type": "page_id", "page_id": parent_id},
+                        "properties": {
+                            "Name": {
+                                "type": "title",
+                                "title": [{"plain_text": "已生成的文章"}],
+                            }
+                        },
+                    },
+                    {
+                        "object": "page",
+                        "id": other_id,
+                        "parent": {
+                            "type": "page_id",
+                            "page_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+                        },
+                        "properties": {
+                            "title": {
+                                "type": "title",
+                                "title": [{"plain_text": "另一个勾选页"}],
+                            }
+                        },
+                    },
+                ],
+                "has_more": False,
+            }, None
+
+        from notion_uploader import list_accessible_pages
+
+        with mock.patch("notion_uploader._request", side_effect=fake_request):
+            listed = list_accessible_pages("u1")
+        self.assertIsNone(listed["error"])
+        self.assertEqual(len(listed["pages"]), 3)
+        root_ids = [p["id"] for p in listed["roots"]]
+        self.assertEqual(root_ids, [parent_id, other_id])
+        self.assertEqual(listed["roots"][0]["title"], "知识库")
+        self.assertEqual(listed["roots"][1]["title"], "另一个勾选页")
+
+    def test_no_token(self):
+        from notion_uploader import list_accessible_pages
+
+        listed = list_accessible_pages("nobody")
+        self.assertEqual(listed["pages"], [])
+        self.assertEqual(listed["roots"], [])
+        self.assertIsNone(listed["error"])
 
 
 if __name__ == "__main__":
