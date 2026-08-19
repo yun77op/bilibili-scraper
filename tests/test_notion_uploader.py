@@ -77,9 +77,9 @@ class MarkdownToBlocksTest(unittest.TestCase):
     def test_headings_quote_paragraph(self):
         md = "> 原视频链接：https://example.com\n\n# 标题\n\n## 小节\n\n一段正文"
         types = self._types(md)
-        self.assertEqual(types, ["quote", "heading_1", "heading_2", "paragraph"])
+        self.assertEqual(types, ["bookmark", "heading_1", "heading_2", "paragraph"])
         blocks = markdown_to_blocks(md)
-        self.assertIn("example.com", blocks[0]["quote"]["rich_text"][0]["text"]["content"])
+        self.assertIn("example.com", blocks[0]["bookmark"]["url"])
 
     def test_lists_and_code(self):
         md = "- a\n- b\n\n1. one\n2. two\n\n```python\nprint(1)\n```"
@@ -163,6 +163,46 @@ class MarkdownToBlocksTest(unittest.TestCase):
 
     def test_heading_deeper_than_3_becomes_h3(self):
         self.assertEqual(self._types("#### 四级"), ["heading_3"])
+
+    def test_inline_and_display_math(self):
+        blocks = markdown_to_blocks("时间复杂度 $O(n \\log n)$ 更优。")
+        kinds = [t["type"] for t in blocks[0]["paragraph"]["rich_text"]]
+        self.assertIn("equation", kinds)
+        expr = next(t["equation"]["expression"] for t in blocks[0]["paragraph"]["rich_text"] if t["type"] == "equation")
+        self.assertIn("log", expr)
+
+        md = "前言\n\n$$\nP(A|B) = \\\\frac{P(B|A)P(A)}{P(B)}\n$$\n\n后记"
+        types = self._types(md)
+        self.assertEqual(types, ["paragraph", "equation", "paragraph"])
+        self.assertIn("frac", markdown_to_blocks(md)[1]["equation"]["expression"])
+
+    def test_currency_not_math(self):
+        texts = markdown_to_blocks("价格 $100$")[0]["paragraph"]["rich_text"]
+        self.assertFalse(any(t.get("type") == "equation" for t in texts))
+        joined = "".join((t.get("text") or {}).get("content") or "" for t in texts)
+        self.assertIn("$100$", joined)
+
+    def test_mermaid_becomes_image(self):
+        md = "```mermaid\nflowchart LR\n  A[\"开始\"] --> B[\"结束\"]\n```"
+        blocks = markdown_to_blocks(md)
+        self.assertEqual(blocks[0]["type"], "image")
+        url = blocks[0]["image"]["external"]["url"]
+        self.assertTrue(url.startswith("https://mermaid.ink/img/"))
+
+    def test_callout_and_plain_quote(self):
+        md = "> 核心要点：先保证供电稳定。\n\n> 普通引用"
+        types = self._types(md)
+        self.assertEqual(types, ["callout", "quote"])
+        self.assertEqual(markdown_to_blocks(md)[0]["callout"]["icon"]["emoji"], "💡")
+
+    def test_standalone_image_and_todo_nested(self):
+        md = "![封面](https://example.com/a.png)\n\n- [x] 已完成\n  - 子项"
+        blocks = markdown_to_blocks(md)
+        self.assertEqual(blocks[0]["type"], "image")
+        self.assertEqual(blocks[1]["type"], "to_do")
+        self.assertTrue(blocks[1]["to_do"]["checked"])
+        children = blocks[1]["to_do"].get("children") or []
+        self.assertEqual(children[0]["type"], "bulleted_list_item")
 
 
 class NotionTokenDbTest(unittest.TestCase):

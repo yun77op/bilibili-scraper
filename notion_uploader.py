@@ -457,44 +457,80 @@ def _plain_rich(text: str, **annotations: Any) -> list[dict[str, Any]]:
     return items
 
 
+def _equation_rich(expr: str) -> list[dict[str, Any]]:
+    expr = str(expr or "").strip()
+    if not expr:
+        return _plain_rich("")
+    return [{"type": "equation", "equation": {"expression": expr[:TEXT_LIMIT]}}]
+
+
+def _equation_block(expr: str) -> dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "equation",
+        "equation": {"expression": (expr or "").strip() or " "},
+    }
+
+
+_INLINE_TOKEN_RE = re.compile(
+    r"!\[(?P<img_alt>[^\]]*)\]\((?P<img_src>[^)]+)\)"
+    r"|\*\*(?P<bold>.+?)\*\*"
+    r"|__(?P<bold2>.+?)__"
+    r"|`(?P<code>[^`]+)`"
+    r"|\[(?P<link_text>[^\]]+)\]\((?P<link_href>[^)]+)\)"
+    r"|~~(?P<strike>.+?)~~"
+    r"|\$\$(?P<display_math>[^$]+)\$\$"
+    r"|\\\((?P<math_paren>.+?)\\\)"
+    r"|\$(?P<math>[^$\n]+?)\$"
+    r"|(?P<url>https?://[^\s<>\]）)，。；、]+)"
+    r"|(?<!\*)\*(?P<italic>.+?)(?<!\*)\*(?!\*)",
+)
+
+_ONLY_IMAGE_RE = re.compile(r"^!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)\s*$")
+_TODO_RE = re.compile(r"^\[([ xX])\]\s+(.*)$")
+_CURRENCY_RE = re.compile(r"^[\d,.\s]+$")
+
+
 def _parse_inline(text: str) -> list[dict[str, Any]]:
-    """Split a line into Notion rich_text (bold / italic / code / link)."""
+    """Split a line into Notion rich_text (bold / italic / code / link / math)."""
     if not text:
         return _plain_rich("")
-    pattern = re.compile(
-        r"!\[[^\]]*\]\([^)]+\)"
-        r"|\*\*(.+?)\*\*"
-        r"|__(.+?)__"
-        r"|`([^`]+)`"
-        r"|\[([^\]]+)\]\(([^)]+)\)"
-        r"|~~(.+?)~~"
-        r"|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
-    )
     out: list[dict[str, Any]] = []
     pos = 0
-    for m in pattern.finditer(text):
+    for m in _INLINE_TOKEN_RE.finditer(text):
         if m.start() > pos:
             out.extend(_plain_rich(text[pos:m.start()]))
-        raw = m.group(0)
-        if raw.startswith("!["):
-            alt = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", raw)
-            if alt:
-                label = alt.group(1) or alt.group(2)
-                out.extend(_plain_rich(label, link=alt.group(2)))
-        elif m.group(1) is not None:
-            out.extend(_plain_rich(m.group(1), bold=True))
-        elif m.group(2) is not None:
-            out.extend(_plain_rich(m.group(2), bold=True))
-        elif m.group(3) is not None:
-            out.extend(_plain_rich(m.group(3), code=True))
-        elif m.group(4) is not None:
-            out.extend(_plain_rich(m.group(4), link=m.group(5)))
-        elif m.group(6) is not None:
-            out.extend(_plain_rich(m.group(6), strikethrough=True))
-        elif m.group(7) is not None:
-            out.extend(_plain_rich(m.group(7), italic=True))
+        gd = m.groupdict()
+        if gd.get("img_alt") is not None:
+            label = gd["img_alt"] or gd["img_src"]
+            out.extend(_plain_rich(label, link=gd["img_src"]))
+        elif gd.get("bold") is not None:
+            out.extend(_plain_rich(gd["bold"], bold=True))
+        elif gd.get("bold2") is not None:
+            out.extend(_plain_rich(gd["bold2"], bold=True))
+        elif gd.get("code") is not None:
+            out.extend(_plain_rich(gd["code"], code=True))
+        elif gd.get("link_text") is not None:
+            out.extend(_plain_rich(gd["link_text"], link=gd["link_href"]))
+        elif gd.get("strike") is not None:
+            out.extend(_plain_rich(gd["strike"], strikethrough=True))
+        elif gd.get("display_math") is not None:
+            out.extend(_equation_rich(gd["display_math"]))
+        elif gd.get("math_paren") is not None:
+            out.extend(_equation_rich(gd["math_paren"]))
+        elif gd.get("math") is not None:
+            inner = gd["math"]
+            if _CURRENCY_RE.match(inner or ""):
+                out.extend(_plain_rich(f"${inner}$"))
+            else:
+                out.extend(_equation_rich(inner))
+        elif gd.get("url") is not None:
+            raw_url = gd["url"].rstrip(".,;:)")
+            out.extend(_plain_rich(raw_url, link=raw_url))
+        elif gd.get("italic") is not None:
+            out.extend(_plain_rich(gd["italic"], italic=True))
         else:
-            out.extend(_plain_rich(raw))
+            out.extend(_plain_rich(m.group(0)))
         pos = m.end()
     if pos < len(text):
         out.extend(_plain_rich(text[pos:]))
@@ -571,6 +607,65 @@ def _code_block(code: str, lang: str) -> dict[str, Any]:
     }
 
 
+def _image_block(url: str, caption: str = "") -> dict[str, Any] | None:
+    href = _normalize_notion_url(url)
+    if not href:
+        return None
+    image: dict[str, Any] = {
+        "type": "external",
+        "external": {"url": href},
+    }
+    if caption.strip():
+        image["caption"] = _plain_rich(caption.strip())
+    return {"object": "block", "type": "image", "image": image}
+
+
+def _mermaid_image_url(source: str) -> str:
+    token = base64.urlsafe_b64encode(source.strip().encode("utf-8")).decode("ascii")
+    return f"https://mermaid.ink/img/{token}"
+
+
+def _fence_lang(header: str) -> str:
+    return (header or "").strip().split(None, 1)[0].lower() if header.strip() else ""
+
+
+def _mermaid_or_code_blocks(source: str) -> list[dict[str, Any]]:
+    url = _mermaid_image_url(source)
+    if len(url) < 1900:
+        img = _image_block(url, "Mermaid 图表")
+        if img is not None:
+            return [img]
+    return [_code_block(source, "mermaid")]
+
+
+def _list_item_block(kind: str, text: str, checked: bool = False) -> dict[str, Any]:
+    if kind == "to_do":
+        return {
+            "object": "block",
+            "type": "to_do",
+            "to_do": {"rich_text": _parse_inline(text), "checked": checked},
+        }
+    return _block(kind, text)
+
+
+def _fold_list_items(items: list[tuple[int, str, str, bool]]) -> list[dict[str, Any]]:
+    """Fold (indent, text, kind, checked) into Notion list blocks with one nesting level."""
+    roots: list[dict[str, Any]] = []
+    stack: list[tuple[int, dict[str, Any]]] = []
+    for indent, text, kind, checked in items:
+        node = _list_item_block(kind, text, checked)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if stack:
+            parent = stack[-1][1]
+            payload = parent[parent["type"]]
+            payload.setdefault("children", []).append(node)
+        else:
+            roots.append(node)
+        stack.append((indent, node))
+    return roots
+
+
 def extract_title(markdown: str, fallback: str = "") -> str:
     """First ATX heading, else fallback, else a generic name."""
     for line in (markdown or "").splitlines():
@@ -592,22 +687,70 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
 
     def paragraph_from(buf: list[str]) -> None:
         text = "\n".join(buf).strip()
-        if text:
-            blocks.append(_block("paragraph", text))
+        if not text:
+            return
+        img = _ONLY_IMAGE_RE.match(text)
+        if img:
+            image = _image_block(img.group("src"), img.group("alt") or "")
+            if image is not None:
+                blocks.append(image)
+                return
+            blocks.append(_block("paragraph", img.group("alt") or img.group("src")))
+            return
+        blocks.append(_block("paragraph", text))
+
+    def is_display_math_open(raw: str) -> bool:
+        s = raw.strip()
+        return s.startswith("$$") or s == "\\[" or s.startswith("\\[")
 
     while i < n:
         line = lines[i]
+        stripped = line.strip()
 
-        if line.startswith("```"):
-            lang = line[3:].strip()
+        if stripped.startswith("```"):
+            lang = _fence_lang(stripped[3:])
             i += 1
             body: list[str] = []
-            while i < n and not lines[i].startswith("```"):
+            while i < n and not lines[i].strip().startswith("```"):
                 body.append(lines[i])
                 i += 1
             if i < n:
                 i += 1
-            blocks.append(_code_block("\n".join(body), lang))
+            source = "\n".join(body)
+            if lang == "mermaid":
+                blocks.extend(_mermaid_or_code_blocks(source))
+            else:
+                blocks.append(_code_block(source, lang))
+            continue
+
+        if is_display_math_open(line):
+            if stripped.startswith("$$") and stripped.endswith("$$") and len(stripped) > 4:
+                blocks.append(_equation_block(stripped[2:-2]))
+                i += 1
+                continue
+            closer = "$$" if stripped.startswith("$$") else "\\]"
+            expr_parts: list[str] = []
+            if stripped.startswith("$$") and stripped != "$$":
+                expr_parts.append(stripped[2:])
+            elif stripped.startswith("\\[") and stripped != "\\[":
+                expr_parts.append(stripped[2:])
+            i += 1
+            while i < n:
+                cur = lines[i]
+                i += 1
+                cs = cur.strip()
+                if closer == "$$" and cs.endswith("$$"):
+                    piece = cs[:-2].strip()
+                    if piece:
+                        expr_parts.append(piece)
+                    break
+                if closer == "\\]" and (cs == "\\]" or cs.endswith("\\]")):
+                    piece = cs[:-2].strip() if cs.endswith("\\]") else ""
+                    if piece:
+                        expr_parts.append(piece)
+                    break
+                expr_parts.append(cur)
+            blocks.append(_equation_block("\n".join(expr_parts)))
             continue
 
         if _HR_RE.match(line):
@@ -627,45 +770,84 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
             while i < n and lines[i].lstrip().startswith(">"):
                 quotes.append(re.sub(r"^\s*>\s?", "", lines[i]))
                 i += 1
-            blocks.append(_block("quote", "\n".join(quotes).strip() or " "))
+            text = "\n".join(quotes).strip() or " "
+            url_m = re.search(r"https?://\S+", text)
+            if text.startswith("原视频链接") and url_m:
+                href = _normalize_notion_url(url_m.group(0))
+                if href:
+                    blocks.append({
+                        "object": "block",
+                        "type": "bookmark",
+                        "bookmark": {
+                            "url": href,
+                            "caption": _plain_rich("原视频链接"),
+                        },
+                    })
+                    continue
+            if "核心要点" in text:
+                blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": _parse_inline(text),
+                        "icon": {"type": "emoji", "emoji": "💡"},
+                        "color": "gray_background",
+                    },
+                })
+            else:
+                blocks.append(_block("quote", text))
             continue
 
         ul = _UL_RE.match(line)
         ol = _OL_RE.match(line)
         if ul or ol:
-            kind = "bulleted_list_item" if ul else "numbered_list_item"
-            items: list[str] = []
+            collected: list[tuple[int, str, str, bool]] = []
             while i < n:
-                cur = _UL_RE.match(lines[i]) if kind == "bulleted_list_item" else _OL_RE.match(lines[i])
-                if not cur:
+                um = _UL_RE.match(lines[i])
+                om = _OL_RE.match(lines[i])
+                if not um and not om:
                     break
-                items.append(cur.group(3))
+                if um:
+                    indent = len(um.group(1).expandtabs(4))
+                    raw_text = um.group(3)
+                    todo = _TODO_RE.match(raw_text)
+                    if todo:
+                        collected.append((indent, todo.group(2), "to_do", todo.group(1) != " "))
+                    else:
+                        collected.append((indent, raw_text, "bulleted_list_item", False))
+                else:
+                    indent = len(om.group(1).expandtabs(4))
+                    collected.append((indent, om.group(3), "numbered_list_item", False))
                 i += 1
-            if items and all(_TOC_ITEM_RE.match(x.strip()) for x in items):
+            toc_texts = [t for _, t, k, _ in collected if k == "bulleted_list_item"]
+            if (
+                toc_texts
+                and len(toc_texts) == len(collected)
+                and all(_TOC_ITEM_RE.match(t.strip()) for t in toc_texts)
+            ):
                 blocks.append({
                     "object": "block",
                     "type": "table_of_contents",
                     "table_of_contents": {"color": "default"},
                 })
             else:
-                for item in items:
-                    blocks.append(_block(kind, item))
+                blocks.extend(_fold_list_items(collected))
             continue
 
         if "|" in line and i + 1 < n and _is_table_divider(lines[i + 1]):
             header = _split_table_cells(line)
             i += 2
-            body: list[list[str]] = []
+            body_rows: list[list[str]] = []
             while i < n and "|" in lines[i] and lines[i].strip() and not _HEADING_RE.match(lines[i]):
                 if _is_table_divider(lines[i]):
                     i += 1
                     continue
-                body.append(_split_table_cells(lines[i]))
+                body_rows.append(_split_table_cells(lines[i]))
                 i += 1
-            blocks.append(_table_block(header, body))
+            blocks.append(_table_block(header, body_rows))
             continue
 
-        if not line.strip():
+        if not stripped:
             i += 1
             continue
 
@@ -674,7 +856,8 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
             nxt = lines[i]
             if (
                 not nxt.strip()
-                or nxt.startswith("```")
+                or nxt.strip().startswith("```")
+                or is_display_math_open(nxt)
                 or _HEADING_RE.match(nxt)
                 or _HR_RE.match(nxt)
                 or nxt.lstrip().startswith(">")
@@ -760,6 +943,31 @@ def _append_children(page_id: str, children: list[dict[str, Any]], token: str) -
     return None
 
 
+def _has_mermaid_ink_image(blocks: list[dict[str, Any]]) -> bool:
+    for block in blocks:
+        url = ((block.get("image") or {}).get("external") or {}).get("url") or ""
+        if "mermaid.ink/img/" in url:
+            return True
+    return False
+
+
+def _mermaid_images_to_code(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for block in blocks:
+        url = ((block.get("image") or {}).get("external") or {}).get("url") or ""
+        if block.get("type") == "image" and "mermaid.ink/img/" in url:
+            token = url.rsplit("/", 1)[-1].split("?", 1)[0]
+            pad = "=" * ((4 - len(token) % 4) % 4)
+            try:
+                src = base64.urlsafe_b64decode(token + pad).decode("utf-8")
+            except Exception:
+                src = "mermaid"
+            out.append(_code_block(src, "mermaid"))
+        else:
+            out.append(block)
+    return out
+
+
 def create_article_page(
     *,
     markdown: str,
@@ -805,6 +1013,9 @@ def create_article_page(
 
     blocks = markdown_to_blocks(markdown)
     data, err = _create_page(target_parent, page_title, blocks, token)
+    if err and _has_mermaid_ink_image(blocks):
+        fallback = _mermaid_images_to_code(blocks)
+        data, err = _create_page(target_parent, page_title, fallback, token)
     if err:
         return {"status": "error", **err}
     return {
