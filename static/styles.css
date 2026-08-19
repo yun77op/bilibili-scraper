@@ -1322,12 +1322,12 @@ pre:has(> code.language-mermaid) svg foreignObject p {
 }
 
 .auth-card {
-  width: min(400px, 100%);
+  width: min(480px, 100%);
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 12px;
   box-shadow: var(--shadow);
-  padding: 36px 32px;
+  padding: 40px 36px;
   text-align: center;
 }
 
