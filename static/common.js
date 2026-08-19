@@ -20,6 +20,47 @@ export function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function toastHost() {
+  let host = document.getElementById("toast-host");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "toast-host";
+    host.className = "toast-host";
+    host.setAttribute("aria-live", "polite");
+    document.body.appendChild(host);
+  }
+  return host;
+}
+
+export function toast(message, { type = "ok", timeout = 3600, href, hrefLabel } = {}) {
+  const el = document.createElement("div");
+  el.className = `toast toast-${type === "err" ? "err" : "ok"}`;
+  const text = document.createElement("span");
+  text.className = "toast-text";
+  text.textContent = String(message || "");
+  el.appendChild(text);
+  if (href) {
+    const a = document.createElement("a");
+    a.className = "toast-link";
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = hrefLabel || "打开";
+    el.appendChild(a);
+  }
+  const close = () => {
+    el.classList.add("toast-out");
+    window.setTimeout(() => el.remove(), 180);
+  };
+  el.addEventListener("click", (ev) => {
+    if (ev.target.closest("a")) return;
+    close();
+  });
+  toastHost().appendChild(el);
+  if (timeout > 0) window.setTimeout(close, timeout);
+  return el;
+}
+
 // 顶部导航栏组件（登录后页面共用）
 export const Navbar = {
   template: `

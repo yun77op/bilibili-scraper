@@ -1,6 +1,6 @@
 // 任务条目组件：状态徽章、展开详情（HTML/转写稿/日志 tab）、操作按钮
 // 展开状态与 tab 是组件内部状态，列表刷新时 Vue 按 :key 保留实例，不重建
-import { api } from "/static/common.js";
+import { api, toast } from "/static/common.js";
 import { sanitizeMarkdown, renderRich } from "/static/markdown.js";
 
 const BADGE_MAP = {
@@ -314,12 +314,17 @@ export default {
         const resp = await api(`/api/jobs/${this.job.id}/save-notion`, { method: "POST" });
         const data = await resp.json();
         if (resp.ok && data.ok) {
+          const n = Number(data.count) || (data.links || []).length || 1;
+          toast(n > 1 ? `已写入 Notion（${n} 页）` : "已写入 Notion", {
+            href: (data.links && data.links[0]) || "",
+            hrefLabel: "打开",
+          });
           this.$emit("refresh");
         } else {
-          alert(data.error || "上传失败");
+          toast(data.error || "写入 Notion 失败", { type: "err", timeout: 6000 });
         }
       } catch {
-        alert("请求失败，请检查服务是否运行");
+        toast("请求失败，请检查服务是否运行", { type: "err", timeout: 6000 });
       } finally {
         this.busy = null;
       }
