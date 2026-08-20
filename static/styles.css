@@ -761,6 +761,67 @@ button.ghost:hover {
   font-size: 12px;
 }
 
+.job-summary-toolbar {
+  flex-wrap: wrap;
+}
+
+.summary-seg {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.summary-seg button {
+  min-height: 28px;
+  margin: 0;
+  padding: 0 10px;
+  border: none;
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+}
+
+.summary-seg button:last-child {
+  border-right: none;
+}
+
+.summary-seg button:hover {
+  color: var(--accent-strong);
+  background: #edf8f6;
+}
+
+.summary-seg button.active {
+  color: var(--accent-strong);
+  background: #edf8f6;
+  font-weight: 600;
+}
+
+.job-summary-empty,
+.job-summary-error {
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 18px 14px;
+  color: var(--muted);
+  background: #faf9f7;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.job-summary-error {
+  border-style: solid;
+  color: var(--danger);
+  background: #fff5f5;
+}
+
+.job-summary-body {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
 /* 下载下拉菜单（HTML tab 工具栏）：主按钮默认下载 HTML，▾ 展开选择 MD/HTML/PDF */
 .job-download-menu {
   position: relative;

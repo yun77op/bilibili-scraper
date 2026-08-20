@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     output_dir      TEXT    DEFAULT '',
     page_output_dirs TEXT   DEFAULT '[]',
     page_articles   TEXT    DEFAULT '[]',
+    summaries       TEXT    DEFAULT '{}',
     created_at      REAL,
     updated_at      REAL
 );
@@ -90,6 +91,7 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN title TEXT DEFAULT ''",
             "ALTER TABLE jobs ADD COLUMN user_id TEXT DEFAULT ''",
             "ALTER TABLE jobs ADD COLUMN worker_pid INTEGER DEFAULT 0",
+            "ALTER TABLE jobs ADD COLUMN summaries TEXT DEFAULT '{}'",
             "ALTER TABLE users ADD COLUMN google_sub TEXT",
             "ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''",
         ):
@@ -118,8 +120,17 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     for key in ("logs", "page_output_dirs", "page_articles"):
         try:
             d[key] = json.loads(d[key])
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, TypeError):
             d[key] = []
+    raw_summaries = d.get("summaries")
+    if isinstance(raw_summaries, str):
+        try:
+            parsed = json.loads(raw_summaries)
+        except json.JSONDecodeError:
+            parsed = {}
+    else:
+        parsed = raw_summaries
+    d["summaries"] = parsed if isinstance(parsed, dict) else {}
     return d
 
 
@@ -141,10 +152,10 @@ def create_job(
     try:
         conn.execute(
             """INSERT INTO jobs (id, user_id, url, title, cookie_string, status, stage, logs, progress,
-               transcript, article, error, output_dir, page_output_dirs, page_articles,
+               transcript, article, error, output_dir, page_output_dirs, page_articles, summaries,
                created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, 'queued', '排队等待', '["已加入任务队列"]', 0,
-                       '', '', '', '', '[]', '[]', ?, ?)""",
+                       '', '', '', '', '[]', '[]', '{}', ?, ?)""",
             (job_id, user_id, url, title, cookie_string, now, now),
         )
         conn.commit()
@@ -251,6 +262,7 @@ def update_job(
     output_dir: str | None = None,
     page_output_dirs: list[str] | None = None,
     page_articles: list[str] | None = None,
+    summaries: dict[str, Any] | None = None,
 ) -> None:
     """Update one or more fields of a job.  Only supplied kwargs are written."""
     conn = _connect()
@@ -269,6 +281,7 @@ def update_job(
             ("output_dir", output_dir),
             ("page_output_dirs", json.dumps(page_output_dirs, ensure_ascii=False) if page_output_dirs is not None else None),
             ("page_articles", json.dumps(page_articles, ensure_ascii=False) if page_articles is not None else None),
+            ("summaries", json.dumps(summaries, ensure_ascii=False) if summaries is not None else None),
         ):
             if val is not None:
                 sets.append(f"{col} = ?")
@@ -277,6 +290,39 @@ def update_job(
         params.append(job_id)
         conn.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", params)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def merge_job_summary(
+    job_id: str, page_index: int, fmt: str, length: str, text: str
+) -> dict[str, Any]:
+    """原子写入一条摘要缓存，避免并发生成互相覆盖。返回合并后的 summaries。"""
+    from summarize import cache_put
+
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT summaries FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            conn.rollback()
+            raise KeyError(job_id)
+        try:
+            cache = json.loads(row["summaries"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+        merged = cache_put(cache, page_index, fmt, length, text)
+        conn.execute(
+            "UPDATE jobs SET summaries = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(merged, ensure_ascii=False), time.time(), job_id),
+        )
+        conn.commit()
+        return merged
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -673,6 +719,7 @@ def retry_job(job_id: str) -> bool:
                SET status = 'queued', stage = '排队等待（重试）', error = '',
                    transcript = '', article = '', title = '', progress = 0,
                    output_dir = '', page_output_dirs = '[]', page_articles = '[]',
+                   summaries = '{}',
                    logs = ?, updated_at = ?
                WHERE id = ? AND status IN ('error', 'cancelled')""",
             (json.dumps(logs, ensure_ascii=False), now, job_id),

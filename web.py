@@ -37,6 +37,7 @@ from app import (
     upload_job_to_notion,
     write_article_html,
 )
+from summarize import summarize_job
 from notion_uploader import (
     auth_status as notion_auth_status,
     exchange_code as notion_exchange_code,
@@ -370,6 +371,36 @@ def create_app() -> Flask:
             return jsonify(upload_job_to_notion(job_id, user["id"]))
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/jobs/<job_id>/summary")
+    @auth.login_required
+    def api_job_summary(job_id: str):
+        user = auth.current_user()
+        job = _db.get_user_job(user["id"], job_id)
+        if job is None:
+            return jsonify({"error": "任务不存在"}), 404
+        data = request.get_json(silent=True) or {}
+        try:
+            result = summarize_job(
+                job,
+                fmt=data.get("format", "paragraph"),
+                length=data.get("length", "medium"),
+                page_index=data.get("page", 0),
+                regenerate=bool(data.get("regenerate")),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not result["cached"]:
+            _db.merge_job_summary(
+                job_id,
+                result["page"],
+                result["format"],
+                result["length"],
+                result["summary"],
+            )
+        return jsonify(result)
 
     @app.get("/api/jobs/<job_id>/download")
     @auth.login_required
