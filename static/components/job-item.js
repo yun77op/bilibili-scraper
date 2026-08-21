@@ -1,4 +1,4 @@
-// 任务条目组件：状态徽章、展开详情（HTML/摘要/转写稿/日志 tab）、操作按钮
+// 任务条目组件：状态徽章、展开详情（HTML/转写稿/日志 tab）、阅读/摘要弹窗、操作按钮
 // 展开状态与 tab 是组件内部状态，列表刷新时 Vue 按 :key 保留实例，不重建
 import { api, toast } from "/static/common.js?v=20260819t2";
 import { sanitizeMarkdown, renderRich } from "/static/markdown.js?v=20260819t2";
@@ -41,6 +41,7 @@ export default {
       htmlContent: null, // HTML 渲染结果（懒渲染缓存）
       htmlRenderedFor: null, // 已渲染的文章内容，列表轮询内容不变时不重渲
       readerOpen: false, // 阅读模式弹窗是否打开
+      summaryOpen: false, // 摘要弹窗是否打开
       readerProgress: 0, // 阅读进度 0-100（按阅读区滚动条位置计算）
       readerObserver: null, // 阅读区尺寸变化监听（刷新进度）
       downloadMenuOpen: false, // 下载下拉菜单是否展开
@@ -70,10 +71,7 @@ export default {
     tabs() {
       const job = this.job;
       if (job.status === "done" && job.article) {
-        const list = [
-          { key: "html", label: "🌐 HTML" },
-          { key: "summary", label: "✨ 摘要" },
-        ];
+        const list = [{ key: "html", label: "🌐 HTML" }];
         if (job.transcript) list.push({ key: "transcript", label: "📝 转写稿" });
         if (job.logs && job.logs.length) list.push({ key: "logs", label: "📋 日志" });
         return list;
@@ -108,6 +106,10 @@ export default {
       }
       return this.job.title || "阅读模式";
     },
+    summaryTitle() {
+      const t = this.readerTitle;
+      return t && t !== "阅读模式" ? `摘要 · ${t}` : "摘要";
+    },
     summaryPage() {
       return this.isMultiPage ? this.activePage : 0;
     },
@@ -139,13 +141,14 @@ export default {
         this.summaryHtml = "";
         this.summaryRenderedFor = null;
         this.summaryError = "";
+        if (this.summaryOpen) this.closeSummary();
       }
       // HTML tab 或阅读弹窗可见时，文章内容若已更新则重新渲染（含 KaTeX 与 Mermaid）
       if ((this.activeTab === "html" || this.readerOpen) && this.htmlRenderedFor !== this.currentArticle) {
         this.renderHtml();
         this.renderRichAfterTick();
       }
-      if (this.activeTab === "summary") this.renderSummary();
+      if (this.summaryOpen) this.renderSummary();
     },
     downloadMenuOpen(open) {
       // 展开时监听文档点击，点击菜单外部收起
@@ -157,7 +160,7 @@ export default {
       if (this.readerOpen) this.$nextTick(() => this.updateReaderProgress());
     },
     currentSummary() {
-      if (this.activeTab === "summary") this.renderSummary();
+      if (this.summaryOpen) this.renderSummary();
     },
   },
   methods: {
@@ -173,12 +176,10 @@ export default {
     },
     switchTab(key) {
       this.activeTab = key;
-      this.summaryError = "";
       if (key === "html") {
         this.renderHtml();
         this.renderRichAfterTick();
       }
-      if (key === "summary") this.renderSummary();
     },
     // ── 下载下拉菜单 ─────────────────────────────
     // 默认动作下载 HTML；展开后可选择 MD / HTML / PDF
@@ -229,7 +230,7 @@ export default {
       this.htmlRenderedFor = null;
       if (this.activeTab === "html" || this.readerOpen) this.renderHtml();
       this.renderRichAfterTick();
-      if (this.activeTab === "summary") {
+      if (this.summaryOpen) {
         this.summaryError = "";
         this.renderSummary();
       }
@@ -245,6 +246,7 @@ export default {
     },
     // 打开阅读模式弹窗：惰性渲染当前文章为 HTML，锁定页面滚动，监听 Esc 关闭
     openReader() {
+      if (this.summaryOpen) this.closeSummary();
       this.renderHtml();
       this.readerProgress = 0;
       this.readerOpen = true;
@@ -264,7 +266,7 @@ export default {
     },
     closeReader() {
       this.readerOpen = false;
-      document.body.classList.remove("reader-open");
+      if (!this.summaryOpen) document.body.classList.remove("reader-open");
       document.removeEventListener("keydown", this.onReaderKeydown);
       if (this.readerObserver) {
         this.readerObserver.disconnect();
@@ -290,19 +292,21 @@ export default {
     onReaderScroll() {
       this.updateReaderProgress();
     },
-    // 组件卸载时清理弹窗残留的监听与滚动锁
-    beforeUnmount() {
-      if (this.readerOpen) {
-        document.body.classList.remove("reader-open");
-        document.removeEventListener("keydown", this.onReaderKeydown);
-      }
-      if (this.readerObserver) {
-        this.readerObserver.disconnect();
-        this.readerObserver = null;
-      }
-      if (this.downloadMenuOpen) {
-        document.removeEventListener("click", this.onDocClick);
-      }
+    openSummary() {
+      if (this.readerOpen) this.closeReader();
+      this.summaryError = "";
+      this.summaryOpen = true;
+      document.body.classList.add("reader-open");
+      document.addEventListener("keydown", this.onSummaryKeydown);
+      this.renderSummary();
+    },
+    closeSummary() {
+      this.summaryOpen = false;
+      if (!this.readerOpen) document.body.classList.remove("reader-open");
+      document.removeEventListener("keydown", this.onSummaryKeydown);
+    },
+    onSummaryKeydown(e) {
+      if (e.key === "Escape") this.closeSummary();
     },
     async retry() {
       if (this.busy) return;
@@ -480,6 +484,20 @@ export default {
       }, 1200);
     },
   },
+  beforeUnmount() {
+    if (this.readerOpen || this.summaryOpen) {
+      document.body.classList.remove("reader-open");
+    }
+    document.removeEventListener("keydown", this.onReaderKeydown);
+    document.removeEventListener("keydown", this.onSummaryKeydown);
+    if (this.readerObserver) {
+      this.readerObserver.disconnect();
+      this.readerObserver = null;
+    }
+    if (this.downloadMenuOpen) {
+      document.removeEventListener("click", this.onDocClick);
+    }
+  },
   template: `
 <div class="job-item" :class="{ expanded }" @click="toggle">
   <div class="job-item-main">
@@ -518,6 +536,11 @@ export default {
       class="job-read-btn" title="阅读模式：弹窗阅读文章"
       @click="openReader"
     >📖</button>
+    <button
+      v-if="job.status === 'done' && currentArticle"
+      class="job-summary-btn" title="摘要：弹窗生成并查看摘要"
+      @click="openSummary"
+    >✨</button>
     <button class="job-delete-btn" title="删除任务" @click="del">🗑</button>
   </div>
   <div class="job-detail-area" v-if="expanded">
@@ -557,46 +580,6 @@ export default {
           <span class="job-page-count">{{ activePage + 1 }} / {{ job.page_articles.length }}</span>
         </div>
         <div class="job-detail-html" ref="htmlPane" v-html="htmlContent"></div>
-      </div>
-      <div v-if="activeTab === 'summary' && job.status === 'done' && currentArticle">
-        <div class="job-tab-toolbar job-summary-toolbar">
-          <div class="summary-seg" role="group" aria-label="摘要格式">
-            <button type="button" :class="{ active: summaryFormat === 'paragraph' }" @click="setSummaryFormat('paragraph')">段落</button>
-            <button type="button" :class="{ active: summaryFormat === 'bullets' }" @click="setSummaryFormat('bullets')">要点</button>
-            <button type="button" :class="{ active: summaryFormat === 'oneliner' }" @click="setSummaryFormat('oneliner')">一句话</button>
-          </div>
-          <div class="summary-seg" role="group" aria-label="摘要篇幅">
-            <button type="button" :class="{ active: summaryLength === 'short' }" @click="setSummaryLength('short')">短</button>
-            <button type="button" :class="{ active: summaryLength === 'medium' }" @click="setSummaryLength('medium')">中</button>
-            <button type="button" :class="{ active: summaryLength === 'long' }" @click="setSummaryLength('long')">长</button>
-          </div>
-          <button
-            class="ghost"
-            :disabled="summaryBusy"
-            @click="generateSummary(!!currentSummary)"
-          >{{ summaryBusy ? '生成中…' : (currentSummary ? '重新生成' : '生成摘要') }}</button>
-          <button
-            v-if="currentSummary"
-            class="ghost job-copy-summary"
-            @click="copySummary"
-          >复制摘要</button>
-        </div>
-        <div class="job-page-picker" v-if="isMultiPage">
-          <select
-            class="job-page-select" :value="activePage"
-            @change="switchPage(Number($event.target.value))"
-            :title="'共 ' + job.page_articles.length + ' 篇，选择要查看的篇目'"
-          >
-            <option v-for="(p, i) in job.page_articles" :key="i" :value="i">第 {{ i + 1 }} 篇 · {{ pageTitle(p) }}</option>
-          </select>
-          <span class="job-page-count">{{ activePage + 1 }} / {{ job.page_articles.length }}</span>
-        </div>
-        <div v-if="summaryError" class="job-summary-error">{{ summaryError }}</div>
-        <div v-else-if="!currentSummary && !summaryBusy" class="job-summary-empty">
-          根据当前文章生成摘要。切换格式或篇幅后，未缓存的组合需要再点一次生成。
-        </div>
-        <div v-else-if="summaryBusy && !currentSummary" class="job-summary-empty">正在根据文章生成摘要…</div>
-        <div v-else class="job-detail-html job-summary-body" v-html="summaryHtml"></div>
       </div>
       <div v-if="activeTab === 'error' && job.status === 'error'">
         <div class="job-detail-article" style="color:var(--danger);background:#fff5f5;">{{ job.error || '未知错误' }}</div>
@@ -644,6 +627,56 @@ export default {
         </div>
         <!-- 阅读进度百分比：固定在阅读区右下角 -->
         <div class="reader-progress-pill" :class="{ done: readerProgress >= 100 }">{{ readerProgress }}%</div>
+      </div>
+    </div>
+  </Teleport>
+  <Teleport to="body">
+    <div v-if="summaryOpen" class="reader-modal summary-modal" @click.stop.self="closeSummary">
+      <div class="reader-modal-panel" role="dialog" aria-modal="true" aria-label="摘要">
+        <div class="reader-modal-head">
+          <div class="reader-modal-title" :title="summaryTitle">{{ summaryTitle }}</div>
+          <div class="reader-modal-tools">
+            <select
+              v-if="isMultiPage"
+              class="job-page-select" :value="activePage"
+              @change="switchPage(Number($event.target.value))"
+              :title="'共 ' + job.page_articles.length + ' 篇，选择要查看的篇目'"
+            >
+              <option v-for="(p, i) in job.page_articles" :key="i" :value="i">第 {{ i + 1 }} 篇 · {{ pageTitle(p) }}</option>
+            </select>
+            <button class="reader-modal-close" @click="closeSummary" title="关闭 (Esc)">✕</button>
+          </div>
+        </div>
+        <div class="job-tab-toolbar job-summary-toolbar">
+          <div class="summary-seg" role="group" aria-label="摘要格式">
+            <button type="button" :class="{ active: summaryFormat === 'paragraph' }" @click="setSummaryFormat('paragraph')">段落</button>
+            <button type="button" :class="{ active: summaryFormat === 'bullets' }" @click="setSummaryFormat('bullets')">要点</button>
+            <button type="button" :class="{ active: summaryFormat === 'oneliner' }" @click="setSummaryFormat('oneliner')">一句话</button>
+          </div>
+          <div class="summary-seg" role="group" aria-label="摘要篇幅">
+            <button type="button" :class="{ active: summaryLength === 'short' }" @click="setSummaryLength('short')">短</button>
+            <button type="button" :class="{ active: summaryLength === 'medium' }" @click="setSummaryLength('medium')">中</button>
+            <button type="button" :class="{ active: summaryLength === 'long' }" @click="setSummaryLength('long')">长</button>
+          </div>
+          <button
+            class="ghost"
+            :disabled="summaryBusy"
+            @click="generateSummary(!!currentSummary)"
+          >{{ summaryBusy ? '生成中…' : (currentSummary ? '重新生成' : '生成摘要') }}</button>
+          <button
+            v-if="currentSummary"
+            class="ghost job-copy-summary"
+            @click="copySummary($event)"
+          >复制摘要</button>
+        </div>
+        <div class="reader-modal-body">
+          <div v-if="summaryError" class="job-summary-error">{{ summaryError }}</div>
+          <div v-else-if="!currentSummary && !summaryBusy" class="job-summary-empty">
+            根据当前文章生成摘要。切换格式或篇幅后，未缓存的组合需要再点一次生成。
+          </div>
+          <div v-else-if="summaryBusy && !currentSummary" class="job-summary-empty">正在根据文章生成摘要…</div>
+          <div v-else class="reader-prose job-detail-html job-summary-body" v-html="summaryHtml"></div>
+        </div>
       </div>
     </div>
   </Teleport>

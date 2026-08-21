@@ -669,7 +669,8 @@ button.ghost:hover {
   background: #fffbeb;
 }
 
-.job-read-btn {
+.job-read-btn,
+.job-summary-btn {
   width: 28px;
   height: 28px;
   min-height: auto;
@@ -686,7 +687,8 @@ button.ghost:hover {
   transition: border-color .15s, color .15s, background .15s;
 }
 
-.job-read-btn:hover {
+.job-read-btn:hover,
+.job-summary-btn:hover {
   border-color: var(--accent);
   color: var(--accent-strong);
   background: #f0faf9;
@@ -820,6 +822,27 @@ button.ghost:hover {
 .job-summary-body {
   max-height: 400px;
   overflow-y: auto;
+}
+
+.summary-modal .job-summary-toolbar {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.summary-modal .job-summary-empty,
+.summary-modal .job-summary-error {
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.summary-modal .job-summary-body {
+  max-height: none;
+  overflow: visible;
+  border: none;
+  padding: 0;
+  background: transparent;
 }
 
 /* 下载下拉菜单（HTML tab 工具栏）：主按钮默认下载 HTML，▾ 展开选择 MD/HTML/PDF */
@@ -1235,6 +1258,14 @@ pre:has(> code.language-mermaid) svg foreignObject p {
 
   .reader-modal-body {
     padding: 20px 16px 40px;
+  }
+
+  .summary-modal .job-summary-toolbar {
+    padding: 10px 16px;
+  }
+
+  .summary-modal .job-summary-toolbar button {
+    width: auto;
   }
 }
 
