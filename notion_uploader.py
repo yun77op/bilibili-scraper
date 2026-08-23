@@ -620,21 +620,12 @@ def _image_block(url: str, caption: str = "") -> dict[str, Any] | None:
     return {"object": "block", "type": "image", "image": image}
 
 
-def _mermaid_image_url(source: str) -> str:
-    token = base64.urlsafe_b64encode(source.strip().encode("utf-8")).decode("ascii")
-    return f"https://mermaid.ink/img/{token}"
-
-
 def _fence_lang(header: str) -> str:
     return (header or "").strip().split(None, 1)[0].lower() if header.strip() else ""
 
 
 def _mermaid_or_code_blocks(source: str) -> list[dict[str, Any]]:
-    url = _mermaid_image_url(source)
-    if len(url) < 1900:
-        img = _image_block(url, "Mermaid 图表")
-        if img is not None:
-            return [img]
+    # Notion 原生支持 language=mermaid 的 code block，比 mermaid.ink 外链图更稳定。
     return [_code_block(source, "mermaid")]
 
 
@@ -943,31 +934,6 @@ def _append_children(page_id: str, children: list[dict[str, Any]], token: str) -
     return None
 
 
-def _has_mermaid_ink_image(blocks: list[dict[str, Any]]) -> bool:
-    for block in blocks:
-        url = ((block.get("image") or {}).get("external") or {}).get("url") or ""
-        if "mermaid.ink/img/" in url:
-            return True
-    return False
-
-
-def _mermaid_images_to_code(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for block in blocks:
-        url = ((block.get("image") or {}).get("external") or {}).get("url") or ""
-        if block.get("type") == "image" and "mermaid.ink/img/" in url:
-            token = url.rsplit("/", 1)[-1].split("?", 1)[0]
-            pad = "=" * ((4 - len(token) % 4) % 4)
-            try:
-                src = base64.urlsafe_b64decode(token + pad).decode("utf-8")
-            except Exception:
-                src = "mermaid"
-            out.append(_code_block(src, "mermaid"))
-        else:
-            out.append(block)
-    return out
-
-
 def create_article_page(
     *,
     markdown: str,
@@ -1013,9 +979,6 @@ def create_article_page(
 
     blocks = markdown_to_blocks(markdown)
     data, err = _create_page(target_parent, page_title, blocks, token)
-    if err and _has_mermaid_ink_image(blocks):
-        fallback = _mermaid_images_to_code(blocks)
-        data, err = _create_page(target_parent, page_title, fallback, token)
     if err:
         return {"status": "error", **err}
     return {

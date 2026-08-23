@@ -182,12 +182,14 @@ class MarkdownToBlocksTest(unittest.TestCase):
         joined = "".join((t.get("text") or {}).get("content") or "" for t in texts)
         self.assertIn("$100$", joined)
 
-    def test_mermaid_becomes_image(self):
+    def test_mermaid_becomes_native_code_block(self):
         md = "```mermaid\nflowchart LR\n  A[\"开始\"] --> B[\"结束\"]\n```"
         blocks = markdown_to_blocks(md)
-        self.assertEqual(blocks[0]["type"], "image")
-        url = blocks[0]["image"]["external"]["url"]
-        self.assertTrue(url.startswith("https://mermaid.ink/img/"))
+        self.assertEqual(blocks[0]["type"], "code")
+        self.assertEqual(blocks[0]["code"]["language"], "mermaid")
+        content = blocks[0]["code"]["rich_text"][0]["text"]["content"]
+        self.assertIn("flowchart LR", content)
+        self.assertIn("开始", content)
 
     def test_callout_and_plain_quote(self):
         md = "> 核心要点：先保证供电稳定。\n\n> 普通引用"
