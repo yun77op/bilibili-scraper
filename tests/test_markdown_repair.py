@@ -6,6 +6,7 @@
 - 整张表格被挤在同一行时的拆分；
 - 多个列表项挤在同一段落时的拆分；
 - 列表 / 表格与相邻段落之间的空行补齐；
+- 空 HTML 锚点标签（``<a name="..."></a>``）的剥离；
 - 代码块保护，以及整体幂等性（修复后不再被二次修改）。
 
 运行方式（项目根目录）：
@@ -128,6 +129,30 @@ class BlankLineInsertionTest(unittest.TestCase):
         self.assertEqual(rep("- 项目\n正文"), "- 项目\n\n正文")
 
 
+class EmptyHtmlAnchorTest(unittest.TestCase):
+    """模型为目录插入的空 <a name/id> 锚点应被剥离。"""
+
+    def test_standalone_name_anchor(self):
+        src = '<a name="1"></a>\n## 引言'
+        self.assertEqual(rep(src), "## 引言")
+
+    def test_inline_before_heading_text(self):
+        src = '<a name="sec2"></a>二、从纺织公司到存储霸主：SK海力士简史'
+        self.assertEqual(rep(src), "二、从纺织公司到存储霸主：SK海力士简史")
+
+    def test_id_and_self_closing(self):
+        self.assertEqual(rep('<a id="foo"></a>\n正文'), "正文")
+        self.assertEqual(rep('<a name="x" />标题'), "标题")
+
+    def test_real_link_kept(self):
+        src = '<a href="https://example.com">官网</a>'
+        self.assertEqual(rep(src), src)
+
+    def test_code_block_kept(self):
+        src = '```html\n<a name="1"></a>\n```'
+        self.assertEqual(rep(src), src)
+
+
 class CodeBlockProtectionTest(unittest.TestCase):
     """代码块（``` 围栏）内的内容必须原样保留。"""
 
@@ -167,6 +192,7 @@ print("hi")
             "要点如下： * 一。 * 二。",
             "正文\n- 项目",
             "- 项目\n正文",
+            '<a name="sec2"></a>\n## 标题',
             "```mermaid\n### #### 别动我\n```",
         ]
         for s in samples:

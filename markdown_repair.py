@@ -8,7 +8,9 @@ LLM 把 Markdown 当作纯文本输出，格式正确性没有任何机制保证
   CommonMark 下这些写法都不会被识别为加粗，星号会裸露显示；
 - 整张表格被挤在同一行（``| A | B || --- | --- || 1 | 2 |``）；
 - 多个列表项被挤在同一段落（``……。 * 要点一。 * 要点二``）；
-- 列表项/表格与相邻段落之间缺少空行，导致被解析器吞并。
+- 列表项/表格与相邻段落之间缺少空行，导致被解析器吞并；
+- 为目录锚点插入的空 HTML 标签（``<a name="sec2"></a>``）：在 Notion
+  等不渲染裸 HTML 的目标里会原样显示。
 
 本模块与 app.py 解耦，便于独立测试。app.py 通过
 ``from markdown_repair import repair_article_markdown`` 使用。
@@ -33,6 +35,8 @@ _EMPH_QUOTE_RE = re.compile(r"\*\*([“‘'\u0022\u300c])([^*\n]+?)([”’'\u00
 # 行首标记只认最前面那一组，后面的 "####" 会作为字面文本显示在标题里。
 # 折叠为层级最深的那一个标记，只保留最靠右、# 数最多的那组。
 _HEADING_GLUE_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<a>#{1,6})[ \t]+(?P<b>#{1,6})(?=[ \t]+)")
+# 模型为 Markdown 目录跳转插入的空锚点；有正文的 <a href>…</a> 不匹配。
+_EMPTY_HTML_ANCHOR_RE = re.compile(r"<a\b[^>]*>\s*</a>|<a\b[^>]*/>", re.IGNORECASE)
 
 
 def _fix_emphasis_spacing(line: str) -> str:
@@ -52,6 +56,11 @@ def _fix_emphasis_spacing(line: str) -> str:
     return _EMPH_QUOTE_RE.sub(
         lambda m: f"{m.group(1)}**{m.group(2)}**{m.group(3)}", line
     )
+
+
+def _strip_empty_html_anchors(line: str) -> str:
+    """去掉空的 ``<a name/id=...>`` 锚点标签，保留同行其余文本。"""
+    return _EMPTY_HTML_ANCHOR_RE.sub("", line)
 
 
 def _repair_squashed_table(line: str) -> list[str]:
@@ -96,7 +105,8 @@ def repair_article_markdown(article: str) -> str:
     2. 整张表格被挤在同一行 → 拆成标准表格行；
     3. 多个列表项挤在同一段落 → 拆成逐项一行；
     4. 列表项/表格与相邻段落之间缺失空行 → 自动补空行；
-    5. 加粗标记首尾多余空格、紧贴引号 → 规范化为标准写法。
+    5. 加粗标记首尾多余空格、紧贴引号 → 规范化为标准写法；
+    6. 空的 HTML 锚点标签（``<a name="..."></a>``）→ 删除。
 
     代码块（``` 围栏）内的内容原样保留，不做任何修改。
     """
@@ -119,6 +129,11 @@ def repair_article_markdown(article: str) -> str:
         else:
             pieces = _split_inline_list_items(line)
         for piece in pieces:
+            stripped = _strip_empty_html_anchors(piece)
+            # 整行只是空锚点时丢掉；原本空行（piece 已是 ""）照常保留
+            if not stripped.strip() and piece.strip():
+                continue
+            piece = stripped
             # 列表项紧跟在普通段落后面时，前面补空行，否则解析器不认；
             # 普通段落紧跟在列表项/表格行后面时同样补空行，避免被吞进上一块
             if out and out[-1].strip() and piece.strip():
