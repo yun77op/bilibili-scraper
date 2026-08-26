@@ -1548,7 +1548,11 @@ def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
 
     page = pages[page_index]
     cid = page["cid"]
-    page_title = page.get("part") or f"P{page_index + 1}"
+    if len(pages) > 1:
+        page_title = page.get("part") or f"P{page_index + 1}"
+    else:
+        # 单 P 时 part 可能是上传工具内部名（如 horizontal_ok），用稿件总标题
+        page_title = total_title or page.get("part") or f"P{page_index + 1}"
     job.title = page_title or total_title
 
     # 合集/分P视频：文件名前加上合集名（多分P用视频总标题，单集用 ugc_season 标题）
