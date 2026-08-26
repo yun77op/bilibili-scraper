@@ -185,22 +185,48 @@ _cancel_sessions: dict[str, tuple[threading.Event, requests.Session]] = {}
 _cancel_lock = threading.Lock()
 
 
-def sanitize_filename(value: str) -> str:
-    value = re.sub(r"[^\w.\u4e00-\u9fff-]+", "-", value).strip("-")
-    return value[:100] or "video"
-
-
-# 目录内最长文件名：sanitize 上限 100 + "-" + yt_id(11) + 扩展名(4) = 116
+# Linux/macOS NAME_MAX 是 255 字节（不是字符）。UTF-8 中文 1 字 = 3 字节，
+# 按字符截断到 100 仍可能 ENAMETOOLONG。
+_NAME_MAX_BYTES = 255
+# 目录内最长文件名的字符预算（Windows MAX_PATH 用）：标题 + "-" + id + 扩展名
 _MAX_INNER_FILENAME_LEN = 116
 
 
+def _utf8_clip(value: str, max_bytes: int) -> str:
+    """按 UTF-8 字节截断，不切开多字节字符。"""
+    if max_bytes <= 0:
+        return ""
+    raw = value.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return value
+    return raw[:max_bytes].decode("utf-8", errors="ignore").rstrip("-.")
+
+
+def sanitize_filename(value: str, max_bytes: int = 180) -> str:
+    value = re.sub(r"[^\w.\u4e00-\u9fff-]+", "-", value).strip("-")
+    return _utf8_clip(value, max_bytes) or "video"
+
+
+def safe_basename(title: str, extra: str = "", ext: str = "") -> str:
+    """拼出不超过 NAME_MAX（255 字节）的单个路径分量。"""
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    tail = f"-{extra}{ext}" if extra else ext
+    stem = sanitize_filename(title, max_bytes=max(8, _NAME_MAX_BYTES - len(tail.encode("utf-8"))))
+    return f"{stem}{tail}"
+
+
 def _output_dir_name(stem: str, suffix: str) -> str:
-    """按 Windows MAX_PATH(260) 预算生成输出目录名，避免路径超长导致文件创建失败。
+    """生成输出目录名：同时满足 Windows MAX_PATH 字符预算和 NAME_MAX 字节上限。
 
     suffix 不含前导 "-"，例如 "20260806-BV1aQMX6oEni-p6"。
     """
     budget = 259 - len(str(OUTPUT_DIR)) - 3 - _MAX_INNER_FILENAME_LEN - len(suffix)
-    return f"{stem[:max(0, budget)]}-{suffix}"
+    stem = stem[: max(0, budget)]
+    tail = f"-{suffix}"
+    stem = _utf8_clip(stem, _NAME_MAX_BYTES - len(tail.encode("utf-8")))
+    name = f"{stem}{tail}" if stem else suffix
+    return _utf8_clip(name, _NAME_MAX_BYTES) or "video"
 
 
 def require_tool(name: str) -> str:
@@ -334,7 +360,7 @@ def download_audio(url: str, out_dir: Path, job: Job, view_data: dict | None = N
         else:
             job.log("未登录时接口只返回整段视频流（MP4/FLV），将下载后提取音频，音质可能低于 DASH", 25)
     extension = audio_extension(audio_stream, audio_url, kind)
-    audio_path = out_dir / f"{sanitize_filename(title)}-{bvid}.{extension}"
+    audio_path = out_dir / safe_basename(title, extra=bvid, ext=extension)
     job.log("正在下载音频文件", 35)
     download_file(audio_url, audio_path, headers, job,
                   backup_urls=audio_stream.get("backup_url") or audio_stream.get("backupUrl") or [])
@@ -443,8 +469,9 @@ def download_youtube_audio(url: str, out_dir: Path, job: Job, info: dict) -> Pat
 
     yt_id = extract_youtube_id(url)
     title = info.get("title") or yt_id
-    safe_title = sanitize_filename(title)
-    output_template = str(out_dir / f"{safe_title}-{yt_id}.%(ext)s")
+    # 中间文件可能是 .webm，按较长扩展名预留字节，避免转换前后超限
+    audio_stem = safe_basename(title, extra=yt_id, ext=".webm").removesuffix(".webm")
+    output_template = str(out_dir / f"{audio_stem}.%(ext)s")
 
     def _progress_hook(d: dict) -> None:
         if d["status"] == "downloading":
@@ -481,9 +508,9 @@ def download_youtube_audio(url: str, out_dir: Path, job: Job, info: dict) -> Pat
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    audio_path = out_dir / f"{safe_title}-{yt_id}.m4a"
+    audio_path = out_dir / f"{audio_stem}.m4a"
     if not audio_path.exists():
-        candidates = sorted(out_dir.glob(f"{safe_title}*.m4a"))
+        candidates = sorted(out_dir.glob(f"{audio_stem}*.m4a"))
         if not candidates:
             candidates = sorted(out_dir.glob("*.m4a"))
         if candidates:
@@ -1711,8 +1738,9 @@ def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
     else:
         job._stage_end("字幕获取(无)")
         job._stage_begin()
+        audio_title = page_title if page_title == total_title else f"{total_title}-{page_title}"
         audio_path = _download_page_audio(
-            bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers,
+            bvid, cid, audio_title, out_dir, job, headers,
             page_label,
             exclusive=upower_exclusive(view_data),
         )
@@ -1802,7 +1830,7 @@ def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
         else:
             job.log(f"{page_label}未登录时接口只返回整段视频流（MP4/FLV），将下载后提取音频，音质可能低于 DASH", 20)
     extension = audio_extension(audio_stream, audio_url, kind)
-    audio_path = out_dir / f"{sanitize_filename(title)}.{extension}"
+    audio_path = out_dir / safe_basename(title, ext=extension)
     job.log(f"{page_label}正在下载音频", 25)
     download_file(audio_url, audio_path, headers, job,
                   backup_urls=audio_stream.get("backup_url") or audio_stream.get("backupUrl") or [])
