@@ -317,7 +317,7 @@ def download_audio(url: str, out_dir: Path, job: Job, view_data: dict | None = N
     try:
         play_data = fetch_bilibili_playurl(params, headers)
     except RuntimeError as exc:
-        raise RuntimeError(f"无法获取播放地址：{_playurl_error_hint(exc)}") from exc
+        raise RuntimeError(_bilibili_request_error_hint("获取播放地址", exc)) from exc
 
     audio_stream, kind = pick_play_stream(
         play_data,
@@ -755,8 +755,43 @@ def _sign_wbi_params(params: dict[str, str], img_key: str, sub_key: str) -> dict
     return signed
 
 
+def _bilibili_api_endpoint(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.path or url
+
+
+def _summarize_http_body(body: str, code: int) -> str:
+    stripped = body.strip()
+    if not stripped:
+        return "空响应体"
+    if stripped.startswith("<!") or stripped.lower().startswith("<html"):
+        title_match = re.search(r"<title>([^<]+)</title>", stripped, re.I)
+        if title_match:
+            title = title_match.group(1).strip()
+            return f"B 站 HTML 拦截页（{title}）"
+        return "B 站 HTML 拦截页（非 JSON）"
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+            msg = payload.get("message") or payload.get("msg") or ""
+            biz_code = payload.get("code")
+            if msg or biz_code is not None:
+                return f"业务 code={biz_code}，message={msg or '未知错误'}"
+        except json.JSONDecodeError:
+            pass
+    if len(stripped) > 120:
+        return stripped[:120] + "…"
+    return stripped
+
+
+def _format_bilibili_http_error(label: str, url: str, code: int, body: str) -> str:
+    endpoint = _bilibili_api_endpoint(url)
+    summary = _summarize_http_body(body, code)
+    return f"[{label}] {endpoint} HTTP {code}：{summary}"
+
+
 def fetch_bilibili_playurl(params: dict[str, str], headers: dict[str, str]) -> dict[str, Any]:
-    last_error: RuntimeError | None = None
+    errors: list[str] = []
     for api_url in BILIBILI_PLAYURL_APIS:
         try:
             request_params = dict(params)
@@ -765,22 +800,20 @@ def fetch_bilibili_playurl(params: dict[str, str], headers: dict[str, str]) -> d
                 request_params = _sign_wbi_params(request_params, img_key, sub_key)
             return bilibili_json(api_url, request_params, headers, "播放地址接口")
         except RuntimeError as exc:
-            last_error = exc
-    if last_error is None:
-        raise RuntimeError("播放地址接口请求失败。")
-    raise last_error
+            errors.append(str(exc))
+    raise RuntimeError("播放地址接口均失败：" + "；".join(errors))
 
 
-def _playurl_error_hint(exc: RuntimeError) -> str:
+def _bilibili_request_error_hint(step: str, exc: RuntimeError) -> str:
     msg = str(exc)
+    hints: list[str] = []
     if "HTTP 403" in msg or "HTTP 412" in msg:
-        proxy = os.getenv("BILIBILI_PROXY", "").strip()
-        if not proxy:
-            return (
-                msg
-                + "（服务器 IP 可能被 B 站限流，请在 .env.local 配置 BILIBILI_PROXY 后重启 worker）"
-            )
-    return msg
+        if not os.getenv("BILIBILI_PROXY", "").strip():
+            hints.append("可在 .env.local 配置 BILIBILI_PROXY 后重启 worker")
+    prefix = f"{step}失败" if step else "请求失败"
+    if hints:
+        return f"{prefix}：{msg}。{'；'.join(hints)}"
+    return f"{prefix}：{msg}"
 
 
 def bilibili_json(
@@ -790,19 +823,20 @@ def bilibili_json(
     label: str,
 ) -> dict[str, Any]:
     url = api_url + "?" + urllib.parse.urlencode(params)
-    data = http_get(url, headers)
+    data = http_get(url, headers, label=label)
+    endpoint = _bilibili_api_endpoint(api_url)
     try:
         payload = json.loads(data.decode("utf-8"))
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{label} 返回的不是 JSON。") from exc
+        raise RuntimeError(f"[{label}] {endpoint} 返回的不是 JSON。") from exc
     code = payload.get("code")
     if code not in (0, None):
         message = payload.get("message") or payload.get("msg") or "未知错误"
-        raise RuntimeError(f"{label} 返回错误：code={code}，message={message}")
+        raise RuntimeError(f"[{label}] {endpoint} 业务错误 code={code}，message={message}")
     return payload
 
 
-def http_get(url: str, headers: dict[str, str], timeout: int = 30) -> bytes:
+def http_get(url: str, headers: dict[str, str], timeout: int = 30, label: str | None = None) -> bytes:
     proxy = os.getenv("BILIBILI_PROXY", "").strip()
     opener = urllib.request.build_opener()
     if proxy:
@@ -812,8 +846,10 @@ def http_get(url: str, headers: dict[str, str], timeout: int = 30) -> bytes:
         with opener.open(request, timeout=timeout) as response:
             return response.read()
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"HTTP {exc.code}：{body}") from exc
+        body = exc.read().decode("utf-8", errors="replace")
+        if label:
+            raise RuntimeError(_format_bilibili_http_error(label, url, exc.code, body)) from exc
+        raise RuntimeError(f"HTTP {exc.code}：{_summarize_http_body(body, exc.code)}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"网络请求失败：{exc.reason}") from exc
 
@@ -1749,7 +1785,7 @@ def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
     try:
         play_data = fetch_bilibili_playurl(params, headers)
     except RuntimeError as exc:
-        raise RuntimeError(f"无法获取播放地址：{_playurl_error_hint(exc)}") from exc
+        raise RuntimeError(_bilibili_request_error_hint("获取播放地址", exc)) from exc
 
     audio_stream, kind = pick_play_stream(
         play_data,
