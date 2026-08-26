@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -59,6 +60,13 @@ BILIBILI_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
+WBI_MIXIN_KEY_TABLE = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+    61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+    36, 20, 34, 44, 52,
+]
+_wbi_key_cache: dict[str, Any] = {"expires_at": 0.0, "img_key": "", "sub_key": ""}
 CUDA_DLL_HANDLES: list[Any] = []
 
 
@@ -278,7 +286,7 @@ def run_command(args: list[str], cwd: Path, job: Job, redactions: list[str] | No
 def fetch_bilibili_view(url: str, job: Job) -> tuple[dict, dict]:
     bvid = extract_bvid(url)
     cookie_string = load_cookie_string(job)
-    headers = build_bilibili_headers(url, cookie_string)
+    headers = ensure_bilibili_visitor_cookie(build_bilibili_headers(url, cookie_string))
     view = bilibili_json(BILIBILI_VIEW_API, {"bvid": bvid}, headers, "视频信息接口")
     return view, headers
 
@@ -300,22 +308,16 @@ def download_audio(url: str, out_dir: Path, job: Job, view_data: dict | None = N
     title = view_data.get("data", {}).get("title") or bvid
 
     job.log("正在获取音频流地址", 25)
-    play_data = None
-    last_error = None
     params = {
         "bvid": bvid,
         "cid": str(cid),
         "fnval": "4048",
         "fourk": "1",
     }
-    for api_url in BILIBILI_PLAYURL_APIS:
-        try:
-            play_data = bilibili_json(api_url, params, headers, "播放地址接口")
-            break
-        except RuntimeError as exc:
-            last_error = exc
-    if play_data is None:
-        raise RuntimeError(f"无法获取播放地址：{last_error}")
+    try:
+        play_data = fetch_bilibili_playurl(params, headers)
+    except RuntimeError as exc:
+        raise RuntimeError(f"无法获取播放地址：{_playurl_error_hint(exc)}") from exc
 
     audio_stream, kind = pick_play_stream(
         play_data,
@@ -620,6 +622,31 @@ def build_bilibili_headers(referer: str, cookie_string: str) -> dict[str, str]:
     return headers
 
 
+def ensure_bilibili_visitor_cookie(headers: dict[str, str]) -> dict[str, str]:
+    cookie = headers.get("Cookie", "")
+    if "buvid3=" in cookie:
+        return headers
+    try:
+        data = http_get(
+            "https://api.bilibili.com/x/frontend/finger/spi",
+            {**headers, "Accept": "application/json, text/plain, */*"},
+        )
+        payload = json.loads(data.decode("utf-8"))
+        finger = payload.get("data") or {}
+        extra = []
+        for key, name in (("b_3", "buvid3"), ("b_4", "buvid4")):
+            value = str(finger.get(key) or "").strip()
+            if value:
+                extra.append(f"{name}={value}")
+        if not extra:
+            return headers
+        updated = dict(headers)
+        updated["Cookie"] = "; ".join(part for part in [cookie.strip(), "; ".join(extra)] if part)
+        return updated
+    except Exception:
+        return headers
+
+
 def load_cookie_string(job: Job, platform: str = "bilibili") -> str:
     if job.cookie_string.strip():
         return job.cookie_string.strip()
@@ -687,6 +714,73 @@ def read_netscape_cookie_file(path: Path) -> str:
                 cookies.append(f"{parts[5]}={parts[6]}")
         return "; ".join(cookies)
     return raw.strip()
+
+
+def _wbi_mixin_key(img_key: str, sub_key: str) -> str:
+    merged = img_key + sub_key
+    return "".join(merged[i] for i in WBI_MIXIN_KEY_TABLE)[:32]
+
+
+def _fetch_wbi_keys(headers: dict[str, str]) -> tuple[str, str]:
+    now = time.time()
+    if _wbi_key_cache["expires_at"] > now and _wbi_key_cache["img_key"]:
+        return _wbi_key_cache["img_key"], _wbi_key_cache["sub_key"]
+    nav = bilibili_json(
+        "https://api.bilibili.com/x/web-interface/nav",
+        {},
+        headers,
+        "WBI 密钥接口",
+    )
+    wbi_img = nav.get("data", {}).get("wbi_img") or {}
+    img_url = str(wbi_img.get("img_url") or "")
+    sub_url = str(wbi_img.get("sub_url") or "")
+    img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
+    sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
+    if not img_key or not sub_key:
+        raise RuntimeError("无法从 nav 接口获取 WBI 密钥。")
+    _wbi_key_cache.update({"img_key": img_key, "sub_key": sub_key, "expires_at": now + 3600})
+    return img_key, sub_key
+
+
+def _sign_wbi_params(params: dict[str, str], img_key: str, sub_key: str) -> dict[str, str]:
+    mixin_key = _wbi_mixin_key(img_key, sub_key)
+    signed = dict(params)
+    signed["wts"] = str(int(time.time()))
+    signed = {
+        key: "".join(ch for ch in str(value) if ch not in "!'()*")
+        for key, value in sorted(signed.items())
+    }
+    query = urllib.parse.urlencode(signed)
+    signed["w_rid"] = hashlib.md5((query + mixin_key).encode()).hexdigest()
+    return signed
+
+
+def fetch_bilibili_playurl(params: dict[str, str], headers: dict[str, str]) -> dict[str, Any]:
+    last_error: RuntimeError | None = None
+    for api_url in BILIBILI_PLAYURL_APIS:
+        try:
+            request_params = dict(params)
+            if "/wbi/" in api_url:
+                img_key, sub_key = _fetch_wbi_keys(headers)
+                request_params = _sign_wbi_params(request_params, img_key, sub_key)
+            return bilibili_json(api_url, request_params, headers, "播放地址接口")
+        except RuntimeError as exc:
+            last_error = exc
+    if last_error is None:
+        raise RuntimeError("播放地址接口请求失败。")
+    raise last_error
+
+
+def _playurl_error_hint(exc: RuntimeError) -> str:
+    msg = str(exc)
+    if "HTTP 403" in msg or "HTTP 412" in msg:
+        proxy = os.getenv("BILIBILI_PROXY", "").strip()
+        if not proxy:
+            return (
+                msg
+                + "（服务器 IP 可能被 B 站限流，请在 .env.local 配置 BILIBILI_PROXY 后重启 worker）"
+            )
+    return msg
 
 
 def bilibili_json(
@@ -1581,8 +1675,11 @@ def _process_bilibili_page(job: Job, bvid: str, view_data: dict, headers: dict,
     else:
         job._stage_end("字幕获取(无)")
         job._stage_begin()
-        audio_path = _download_page_audio(bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers,
-                                          page_label, exclusive=upower_exclusive(view_data))
+        audio_path = _download_page_audio(
+            bvid, cid, f"{total_title}-{page_title}", out_dir, job, headers,
+            page_label,
+            exclusive=upower_exclusive(view_data),
+        )
         job._stage_end("音频下载")
         job._stage_begin()
         transcript = transcribe_audio(audio_path, out_dir, job, page_label)
@@ -1648,17 +1745,11 @@ def _download_page_audio(bvid: str, cid: int, title: str, out_dir: Path,
     """Download audio for a specific page CID."""
     job.log(f"{page_label}正在获取音频流", 20)
 
-    last_error = None
     params: dict[str, str] = {"bvid": bvid, "cid": str(cid), "fnval": "4048", "fourk": "1"}
-    play_data = None
-    for api_url in BILIBILI_PLAYURL_APIS:
-        try:
-            play_data = bilibili_json(api_url, params, headers, "播放地址接口")
-            break
-        except RuntimeError as exc:
-            last_error = exc
-    if play_data is None:
-        raise RuntimeError(f"无法获取播放地址：{last_error}")
+    try:
+        play_data = fetch_bilibili_playurl(params, headers)
+    except RuntimeError as exc:
+        raise RuntimeError(f"无法获取播放地址：{_playurl_error_hint(exc)}") from exc
 
     audio_stream, kind = pick_play_stream(
         play_data,
