@@ -107,7 +107,8 @@ function fixEmphasisSpacing(md) {
 
 // ── LaTeX 数学公式保护 ─────────────────────────────
 const MATH_PLACEHOLDER = "KATEXMATHSEG{}Z";
-const MATH_SEGMENT_RE = /```[\s\S]*?```|\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$/g;
+// 美元金额（$2,000）不当公式；公式里的 \$ 不当结束符。
+const MATH_SEGMENT_RE = /```[\s\S]*?```|\$\$(?:\\.|[^$])+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$(?!\d)(?:\\.|[^$\n])+?\$/g;
 
 function protectMathSegments(md) {
   const segments = [];

@@ -182,6 +182,70 @@ class MarkdownToBlocksTest(unittest.TestCase):
         joined = "".join((t.get("text") or {}).get("content") or "" for t in texts)
         self.assertIn("$100$", joined)
 
+    def _joined_text(self, md: str) -> str:
+        def collect(blocks) -> str:
+            parts: list[str] = []
+            for block in blocks:
+                kind = block.get("type")
+                payload = block.get(kind) or {}
+                if kind == "equation":
+                    parts.append(payload.get("expression") or "")
+                    continue
+                for t in payload.get("rich_text") or []:
+                    if t.get("type") == "equation":
+                        parts.append((t.get("equation") or {}).get("expression") or "")
+                    else:
+                        parts.append((t.get("text") or {}).get("content") or "")
+                if kind == "table":
+                    for row in payload.get("children") or []:
+                        for cell in (row.get("table_row") or {}).get("cells") or []:
+                            for t in cell:
+                                if t.get("type") == "equation":
+                                    parts.append((t.get("equation") or {}).get("expression") or "")
+                                else:
+                                    parts.append((t.get("text") or {}).get("content") or "")
+            return "".join(parts)
+        return collect(markdown_to_blocks(md))
+
+    def _equation_exprs(self, md: str) -> list[str]:
+        exprs: list[str] = []
+        def walk(blocks) -> None:
+            for block in blocks:
+                kind = block.get("type")
+                payload = block.get(kind) or {}
+                if kind == "equation":
+                    exprs.append(payload.get("expression") or "")
+                for t in payload.get("rich_text") or []:
+                    if t.get("type") == "equation":
+                        exprs.append((t.get("equation") or {}).get("expression") or "")
+                if kind == "table":
+                    for row in payload.get("children") or []:
+                        for cell in (row.get("table_row") or {}).get("cells") or []:
+                            for t in cell:
+                                if t.get("type") == "equation":
+                                    exprs.append((t.get("equation") or {}).get("expression") or "")
+                walk(payload.get("children") or [])
+        walk(markdown_to_blocks(md))
+        return exprs
+
+    def test_dollar_amounts_not_paired_as_math(self):
+        md = (
+            "从$2,000风险到$10,500日收益。"
+            "约$2,430-$2,700。"
+            "从$8,500的完美猎取，到$2,000的坦然止损。"
+        )
+        self.assertEqual(self._equation_exprs(md), [])
+        joined = self._joined_text(md)
+        self.assertIn("$2,000", joined)
+        self.assertIn("$10,500", joined)
+        self.assertIn("$2,430-$2,700", joined)
+        self.assertIn("$8,500", joined)
+
+    def test_escaped_dollar_inside_math_stays_one_equation(self):
+        md = r"设定 $R = \$2,000$，$G = \$10,000$，目标 $= 5:1$。"
+        exprs = self._equation_exprs(md)
+        self.assertEqual(exprs, [r"R = \$2,000", r"G = \$10,000", r"= 5:1"])
+
     def test_mermaid_becomes_native_code_block(self):
         md = "```mermaid\nflowchart LR\n  A[\"开始\"] --> B[\"结束\"]\n```"
         blocks = markdown_to_blocks(md)

@@ -2217,11 +2217,11 @@ def write_article_pdf(article: str, path: Path) -> None:
 
 _MATH_PLACEHOLDER = "KATEXMATHSEG{}Z"
 _MATH_SEGMENT_RE = re.compile(
-    r"```.*?```"        # fenced code block — kept intact, no math inside
-    r"|\$\$.+?\$\$"     # $$...$$
-    r"|\\\[.+?\\\]"     # \[ ... \]
-    r"|\\\(.+?\\\)"     # \( ... \)
-    r"|\$[^$\n]+?\$",   # $...$ (single line)
+    r"```.*?```"                      # fenced code block — kept intact
+    r"|\$\$(?:\\.|[^$])+?\$\$"        # $$...$$（允许公式内 \$）
+    r"|\\\[.+?\\\]"                   # \[ ... \]
+    r"|\\\(.+?\\\)"                   # \( ... \)
+    r"|\$(?!\d)(?:\\.|[^$\n])+?\$",  # $...$：跳过 $2,000 这类金额
     re.DOTALL,
 )
 

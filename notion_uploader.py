@@ -472,6 +472,7 @@ def _equation_block(expr: str) -> dict[str, Any]:
     }
 
 
+# 行内 $...$：美元金额（$2,000）不当公式；公式里的 \$ 不当结束符。
 _INLINE_TOKEN_RE = re.compile(
     r"!\[(?P<img_alt>[^\]]*)\]\((?P<img_src>[^)]+)\)"
     r"|\*\*(?P<bold>.+?)\*\*"
@@ -479,16 +480,32 @@ _INLINE_TOKEN_RE = re.compile(
     r"|`(?P<code>[^`]+)`"
     r"|\[(?P<link_text>[^\]]+)\]\((?P<link_href>[^)]+)\)"
     r"|~~(?P<strike>.+?)~~"
-    r"|\$\$(?P<display_math>[^$]+)\$\$"
+    r"|\$\$(?P<display_math>(?:\\.|[^$])+?)\$\$"
     r"|\\\((?P<math_paren>.+?)\\\)"
-    r"|\$(?P<math>[^$\n]+?)\$"
+    r"|\$(?!\d)(?P<math>(?:\\.|[^$\n])+?)\$"
     r"|(?P<url>https?://[^\s<>\]）)，。；、]+)"
     r"|(?<!\*)\*(?P<italic>.+?)(?<!\*)\*(?!\*)",
 )
 
 _ONLY_IMAGE_RE = re.compile(r"^!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)\s*$")
 _TODO_RE = re.compile(r"^\[([ xX])\]\s+(.*)$")
-_CURRENCY_RE = re.compile(r"^[\d,.\s]+$")
+_CURRENCY_RE = re.compile(r"^[\d,.\s\-–—]+$")
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
+_LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+")
+
+
+def _should_emit_equation(expr: str) -> bool:
+    """Return False for currency / 中文片段，避免 Notion 显示 Invalid equation。"""
+    s = (expr or "").strip()
+    if not s:
+        return False
+    if _CURRENCY_RE.match(s):
+        return False
+    if _CJK_RE.search(s) and not _LATEX_CMD_RE.search(s):
+        return False
+    if s.endswith("\\") and not s.endswith("\\\\"):
+        return False
+    return True
 
 
 def _parse_inline(text: str) -> list[dict[str, Any]]:
@@ -515,15 +532,23 @@ def _parse_inline(text: str) -> list[dict[str, Any]]:
         elif gd.get("strike") is not None:
             out.extend(_plain_rich(gd["strike"], strikethrough=True))
         elif gd.get("display_math") is not None:
-            out.extend(_equation_rich(gd["display_math"]))
+            inner = gd["display_math"]
+            if _should_emit_equation(inner):
+                out.extend(_equation_rich(inner))
+            else:
+                out.extend(_plain_rich(f"$${inner}$$"))
         elif gd.get("math_paren") is not None:
-            out.extend(_equation_rich(gd["math_paren"]))
+            inner = gd["math_paren"]
+            if _should_emit_equation(inner):
+                out.extend(_equation_rich(inner))
+            else:
+                out.extend(_plain_rich(f"\\({inner}\\)"))
         elif gd.get("math") is not None:
             inner = gd["math"]
-            if _CURRENCY_RE.match(inner or ""):
-                out.extend(_plain_rich(f"${inner}$"))
-            else:
+            if _should_emit_equation(inner):
                 out.extend(_equation_rich(inner))
+            else:
+                out.extend(_plain_rich(f"${inner}$"))
         elif gd.get("url") is not None:
             raw_url = gd["url"].rstrip(".,;:)")
             out.extend(_plain_rich(raw_url, link=raw_url))
