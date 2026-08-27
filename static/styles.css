@@ -2018,3 +2018,12 @@ pre:has(> code.language-mermaid) svg foreignObject p {
     max-width: none;
   }
 }
+
+/* 页面底部构建版本号 */
+.build-info {
+  padding: 18px 0 26px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  user-select: none;
+}

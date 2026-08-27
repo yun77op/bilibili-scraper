@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import time
 import uuid
 import zipfile
@@ -52,6 +53,42 @@ _REGISTER_LIMIT = 5
 _register_attempts: dict[str, list[float]] = {}
 
 
+def _build_hash() -> str:
+    """版本标识：优先 BUILD_HASH 环境变量（部署机可能没有 .git），否则取 git 短 hash。"""
+    env_hash = os.getenv("BUILD_HASH", "").strip()
+    if env_hash:
+        return env_hash
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "dev"
+
+
+_BUILD_HASH = _build_hash()
+_page_cache: dict[str, tuple[float, str]] = {}
+
+
+def _send_page(name: str) -> Response:
+    """发送 static 下的页面，把 __BUILD_HASH__ 占位符替换为版本号（按 mtime 缓存）。"""
+    path = STATIC_DIR / name
+    mtime = path.stat().st_mtime
+    cached = _page_cache.get(name)
+    if cached and cached[0] == mtime:
+        return Response(cached[1], mimetype="text/html; charset=utf-8")
+    html = path.read_text(encoding="utf-8").replace("__BUILD_HASH__", _BUILD_HASH)
+    _page_cache[name] = (mtime, html)
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
 def _public_base_url() -> str:
     """Canonical public origin for OAuth redirect URIs.
 
@@ -88,42 +125,42 @@ def create_app() -> Flask:
         # 公开落地页；已登录用户直接进入工作台
         if auth.current_user():
             return redirect(url_for("workspace"))
-        return send_file(STATIC_DIR / "landing.html", mimetype="text/html; charset=utf-8")
+        return _send_page("landing.html")
 
     @app.get("/app")
     @auth.login_required
     def workspace():
-        return send_file(STATIC_DIR / "index.html", mimetype="text/html; charset=utf-8")
+        return _send_page("index.html")
 
     @app.get("/settings")
     @auth.login_required
     def settings_page():
-        return send_file(STATIC_DIR / "settings.html", mimetype="text/html; charset=utf-8")
+        return _send_page("settings.html")
 
     @app.get("/kb")
     @auth.login_required
     def kb_page():
-        return send_file(STATIC_DIR / "kb.html", mimetype="text/html; charset=utf-8")
+        return _send_page("kb.html")
 
     @app.get("/login")
     def login_page():
         if auth.current_user():
             return redirect(url_for("workspace"))
-        return send_file(STATIC_DIR / "login.html", mimetype="text/html; charset=utf-8")
+        return _send_page("login.html")
 
     @app.get("/register")
     def register_page():
         if auth.current_user():
             return redirect(url_for("workspace"))
-        return send_file(STATIC_DIR / "register.html", mimetype="text/html; charset=utf-8")
+        return _send_page("register.html")
 
     @app.get("/privacy")
     def privacy_page():
-        return send_file(STATIC_DIR / "privacy.html", mimetype="text/html; charset=utf-8")
+        return _send_page("privacy.html")
 
     @app.get("/terms")
     def terms_page():
-        return send_file(STATIC_DIR / "terms.html", mimetype="text/html; charset=utf-8")
+        return _send_page("terms.html")
 
     # ------------------------------------------------------------------
     # Auth API
