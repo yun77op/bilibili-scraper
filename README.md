@@ -273,3 +273,12 @@ PORT=8080 ./stop.sh
 - 生产环境建议多线程：`python server.py --host 0.0.0.0 --port 8085 --threads 8`
 - 管理员可在设置页底部查看 DeepSeek / Whisper / Worker 状态，并禁用恶意用户
 - 升级自旧版（无用户体系）时无需迁移：旧任务数据保留，第一个注册的管理员自动继承
+
+## 竞品参考
+
+| 项目 | 定位 | 技术要点 |
+|------|------|----------|
+| [BiliNote](https://github.com/JefferyHcool/BiliNote) | AI 视频笔记助手：粘贴 B 站 / YouTube / 抖音链接自动生成 Markdown 笔记，支持截图插入、原片跳转、AI 问答，另有托管版 bilinote.app | React 19 + FastAPI；B 站下载走 yt-dlp（Netscape Cookie 文件 + Referer），并 monkey-patch yt-dlp 给 playurl 请求注入 `dm_img_*` / `web_location` 风控指纹参数（参与 WBI 签名），应对 2026-06 起 B 站网关的 412/403 拦截 |
+| [Bili.Copilot（哔哩助理）](https://github.com/Richasy/Bili.Copilot) | Windows 11 第三方 B 站桌面客户端：视频浏览、播放、下载与 AI 总结 | .NET / WinUI 3；播放用内置 MPV 或外部播放器；下载内置 BBDown 抓流 + ffmpeg 混流，也支持外置 BBDown；接入 20 余种 AI 模型做视频/文章总结与对话 |
+
+排查 B 站 403/412 时可优先参考 BiliNote 的做法（yt-dlp + 风控参数注入），详见 [project-docs/Bilibili-播放地址排查.md](project-docs/Bilibili-播放地址排查.md)。
