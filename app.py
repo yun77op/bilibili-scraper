@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import site
+import string
 import subprocess
 import sys
 import tempfile
@@ -769,6 +772,22 @@ def _fetch_wbi_keys(headers: dict[str, str]) -> tuple[str, str]:
     return img_key, sub_key
 
 
+def _build_dm_img_params() -> dict[str, str]:
+    # 2026-06 起 B 站 wbi/playurl 网关要求 dm_img_* / web_location 风控指纹参数，
+    # 缺失会返回 HTTP 412/403（刷新 Cookie 无效）；取值方式参考 BiliNote 的 yt-dlp 补丁
+    return {
+        "web_location": "1550101",
+        "dm_img_list": "[]",
+        "dm_img_str": base64.b64encode(
+            "".join(random.choices(string.printable, k=random.randint(16, 64))).encode()
+        )[:-2].decode(),
+        "dm_cover_img_str": base64.b64encode(
+            "".join(random.choices(string.printable, k=random.randint(32, 128))).encode()
+        )[:-2].decode(),
+        "dm_img_inter": '{"ds":[],"wh":[6093,6631,31],"of":[430,760,380]}',
+    }
+
+
 def _sign_wbi_params(params: dict[str, str], img_key: str, sub_key: str) -> dict[str, str]:
     mixin_key = _wbi_mixin_key(img_key, sub_key)
     signed = dict(params)
@@ -824,7 +843,9 @@ def fetch_bilibili_playurl(params: dict[str, str], headers: dict[str, str]) -> d
             request_params = dict(params)
             if "/wbi/" in api_url:
                 img_key, sub_key = _fetch_wbi_keys(headers)
-                request_params = _sign_wbi_params(request_params, img_key, sub_key)
+                request_params = _sign_wbi_params(
+                    {**request_params, **_build_dm_img_params()}, img_key, sub_key
+                )
             return bilibili_json(api_url, request_params, headers, "播放地址接口")
         except RuntimeError as exc:
             errors.append(str(exc))
