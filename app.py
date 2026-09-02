@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -49,7 +50,11 @@ WHISPER_MODEL_DIR = MODEL_DIR / "whisper"
 LOCAL_WHISPER_DIR = MODEL_DIR / "faster-whisper"
 ENV_FILE = ROOT / ".env.local"
 CONFIG_FILE = ROOT / "config.json"
-BILIBILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
+BILIBILI_VIEW_APIS = [
+    # 2026-09 起 /x/web-interface/view 也开始 412 风控，优先走带 wbi 签名的网关
+    "https://api.bilibili.com/x/web-interface/wbi/view",
+    "https://api.bilibili.com/x/web-interface/view",
+]
 BILIBILI_PLAYURL_APIS = [
     "https://api.bilibili.com/x/player/wbi/playurl",
     "https://api.bilibili.com/x/player/playurl",
@@ -312,12 +317,71 @@ def run_command(args: list[str], cwd: Path, job: Job, redactions: list[str] | No
         raise RuntimeError(f"命令执行失败，退出码 {code}：{' '.join(args)}")
 
 
+def _is_bilibili_ban_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "HTTP 412" in msg
+        or "code=-412" in msg
+        or "request was banned" in msg
+    )
+
+
 def fetch_bilibili_view(url: str, job: Job) -> tuple[dict, dict]:
     bvid = extract_bvid(url)
     cookie_string = load_cookie_string(job)
     headers = ensure_bilibili_visitor_cookie(build_bilibili_headers(url, cookie_string))
-    view = bilibili_json(BILIBILI_VIEW_API, {"bvid": bvid}, headers, "视频信息接口")
-    return view, headers
+    params = {"bvid": bvid}
+    errors: list[str] = []
+    for attempt in range(2):
+        if attempt:
+            # -412 常因当前访客指纹被拉黑：等一下换一套 buvid 再试一轮
+            time.sleep(1.5)
+            headers = ensure_bilibili_visitor_cookie(
+                build_bilibili_headers(url, cookie_string), force=True
+            )
+        for api_url in BILIBILI_VIEW_APIS:
+            try:
+                request_params = dict(params)
+                if "/wbi/" in api_url:
+                    img_key, sub_key = _fetch_wbi_keys(headers)
+                    request_params = _sign_wbi_params(
+                        {**request_params, **_build_dm_img_params()}, img_key, sub_key
+                    )
+                view = bilibili_json(api_url, request_params, headers, "视频信息接口")
+                return view, headers
+            except RuntimeError as exc:
+                if not _is_bilibili_ban_error(exc):
+                    raise
+                errors.append(str(exc))
+    try:
+        # 两个网关都被风控时，改从视频页 HTML 的 __INITIAL_STATE__ 取同样的数据
+        return _fetch_view_from_html(bvid, headers), headers
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    raise RuntimeError("视频信息接口均失败：" + "；".join(errors))
+
+
+def _fetch_view_from_html(bvid: str, headers: dict[str, str]) -> dict[str, Any]:
+    html_url = f"https://www.bilibili.com/video/{bvid}/"
+    html_headers = {
+        **headers,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    data = http_get(html_url, html_headers, label="视频页")
+    if data[:2] == b"\x1f\x8b":  # www.bilibili.com 不询问就返回 gzip 内容
+        data = gzip.decompress(data)
+    text = data.decode("utf-8", errors="replace")
+    match = re.search(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\(function", text, re.S)
+    if not match:
+        raise RuntimeError("视频页里没有找到 __INITIAL_STATE__ 数据。")
+    try:
+        state = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("视频页 __INITIAL_STATE__ 不是有效 JSON。") from exc
+    video_data = state.get("videoData") or {}
+    if not video_data.get("pages"):
+        raise RuntimeError("视频页 __INITIAL_STATE__ 里没有视频数据（视频可能不存在）。")
+    return {"data": video_data}
 
 
 def download_audio(url: str, out_dir: Path, job: Job, view_data: dict | None = None, headers: dict | None = None) -> Path:
@@ -652,9 +716,9 @@ def build_bilibili_headers(referer: str, cookie_string: str) -> dict[str, str]:
     return headers
 
 
-def ensure_bilibili_visitor_cookie(headers: dict[str, str]) -> dict[str, str]:
+def ensure_bilibili_visitor_cookie(headers: dict[str, str], force: bool = False) -> dict[str, str]:
     cookie = headers.get("Cookie", "")
-    if "buvid3=" in cookie:
+    if not force and "buvid3=" in cookie:
         return headers
     try:
         data = http_get(
@@ -760,6 +824,8 @@ def _fetch_wbi_keys(headers: dict[str, str]) -> tuple[str, str]:
         {},
         headers,
         "WBI 密钥接口",
+        # 访客模式下 nav 返回 -101「账号未登录」，但 data.wbi_img 依然有效
+        ok_codes=(-101,),
     )
     wbi_img = nav.get("data", {}).get("wbi_img") or {}
     img_url = str(wbi_img.get("img_url") or "")
@@ -773,7 +839,7 @@ def _fetch_wbi_keys(headers: dict[str, str]) -> tuple[str, str]:
 
 
 def _build_dm_img_params() -> dict[str, str]:
-    # 2026-06 起 B 站 wbi/playurl 网关要求 dm_img_* / web_location 风控指纹参数，
+    # 2026-06 起 B 站 wbi 网关（playurl/view 等）要求 dm_img_* / web_location 风控指纹参数，
     # 缺失会返回 HTTP 412/403（刷新 Cookie 无效）；取值方式参考 BiliNote 的 yt-dlp 补丁
     return {
         "web_location": "1550101",
@@ -869,6 +935,7 @@ def bilibili_json(
     params: dict[str, str],
     headers: dict[str, str],
     label: str,
+    ok_codes: tuple[int, ...] = (0,),
 ) -> dict[str, Any]:
     url = api_url + "?" + urllib.parse.urlencode(params)
     data = http_get(url, headers, label=label)
@@ -878,7 +945,7 @@ def bilibili_json(
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"[{label}] {endpoint} 返回的不是 JSON。") from exc
     code = payload.get("code")
-    if code not in (0, None):
+    if code not in (0, None) and code not in ok_codes:
         message = payload.get("message") or payload.get("msg") or "未知错误"
         raise RuntimeError(f"[{label}] {endpoint} 业务错误 code={code}，message={message}")
     return payload
