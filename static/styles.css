@@ -314,6 +314,28 @@ button.ghost:hover {
   color: var(--muted);
 }
 
+.bilibili-qr-panel {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  width: fit-content;
+  background: #fff;
+}
+
+.bilibili-qr-box {
+  width: 200px;
+  height: 200px;
+}
+
+.bilibili-qr-box img,
+.bilibili-qr-box canvas {
+  width: 100%;
+  height: 100%;
+}
+
 .channel-group {
   display: grid;
   gap: 8px;

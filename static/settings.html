@@ -99,6 +99,33 @@
             </div>
           </section>
 
+          <section class="config-section">
+            <div class="config-head">
+              <h3>📺 Bilibili 鉴权</h3>
+            </div>
+            <div class="config-body">
+              <div class="channel-group">
+                <div class="cookie-config">
+                  <div class="cookie-row">
+                    <span class="cookie-status">{{ bilibiliCookieStatusText }}</span>
+                    <button type="button" class="ghost" :disabled="bilibiliBusy" @click="bilibiliQrStart">
+                      {{ bilibiliQrBtnText }}
+                    </button>
+                  </div>
+                  <span class="cookie-status">{{ bilibiliQrStatusText }}</span>
+                  <div class="bilibili-qr-panel" v-if="bilibiliQrVisible">
+                    <div id="bilibili-qr-box" class="bilibili-qr-box"></div>
+                    <p class="hint">请用 B 站 App 扫码并在手机上确认登录</p>
+                  </div>
+                </div>
+                <p class="hint">
+                  服务器 IP 容易被 B 站风控拦截，配置登录 Cookie 后可大幅降低 412/被禁概率。
+                  建议使用小号扫码；Cookie 失效后（数月）重新扫码即可。
+                </p>
+              </div>
+            </div>
+          </section>
+
           <section class="config-section" v-if="isAdmin">
             <div class="config-head">
               <h3>🛠 管理员</h3>
@@ -136,6 +163,7 @@
       </main>
     </div>
     <footer class="build-info">build __BUILD_HASH__</footer>
+    <script src="/static/vendor/qrcode/qrcode.min.js"></script>
     <script type="module" src="/static/settings.js"></script>
   </body>
 </html>

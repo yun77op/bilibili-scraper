@@ -289,6 +289,7 @@ def create_app() -> Flask:
                 "notion_parent_page_id": str(settings.get("notion_parent_page_id", "")).strip(),
                 "date_subdir": bool(settings.get("date_subdir")),
                 "youtube_cookie_configured": bool(str(settings.get("youtube_cookie", "")).strip()),
+                "bilibili_cookie_configured": bool(str(settings.get("bilibili_cookie", "")).strip()),
             },
             "notion_configured": status["authenticated"],
             "notion_workspace": status["workspace"],
@@ -352,10 +353,11 @@ def create_app() -> Flask:
         ):
             return jsonify({"error": "请输入有效的 Bilibili 或 YouTube URL"}), 400
 
-        # Per-user YouTube cookie; an explicit cookie overrides it for this job
+        # Per-user cookie; an explicit cookie overrides it for this job
         cookie_string = str(data.get("cookie", "")).strip()
         if not cookie_string:
-            cookie_string = str((user["settings"] or {}).get("youtube_cookie", "")).strip()
+            cookie_key = "bilibili_cookie" if "bilibili.com" in url else "youtube_cookie"
+            cookie_string = str((user["settings"] or {}).get(cookie_key, "")).strip()
 
         job_id = uuid.uuid4().hex[:12]
         try:
@@ -592,6 +594,86 @@ def create_app() -> Flask:
         settings["youtube_cookie"] = cookie_str
         _db.update_user(user["id"], settings=settings)
         return jsonify({"ok": True})
+
+    # ------------------------------------------------------------------
+    # Bilibili 扫码登录（passport 二维码接口，Cookie 存 per-user settings）
+    # ------------------------------------------------------------------
+
+    _BILIBILI_PASSPORT_HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://passport.bilibili.com/",
+    }
+
+    @app.post("/api/bilibili/qr/start")
+    @auth.login_required
+    def api_bilibili_qr_start():
+        import requests as _requests
+
+        try:
+            resp = _requests.get(
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+                headers=_BILIBILI_PASSPORT_HEADERS, timeout=15,
+            )
+            payload = resp.json()
+        except Exception as exc:
+            return jsonify({"error": f"请求 B 站二维码接口失败：{exc}"}), 502
+        data = payload.get("data") or {}
+        qr_url = str(data.get("url") or "")
+        qr_key = str(data.get("qrcode_key") or "")
+        if payload.get("code") != 0 or not qr_url or not qr_key:
+            return jsonify({"error": "B 站未返回二维码，请稍后重试"}), 502
+        return jsonify({"qr_url": qr_url, "qrcode_key": qr_key})
+
+    @app.get("/api/bilibili/qr/poll")
+    @auth.login_required
+    def api_bilibili_qr_poll():
+        import requests as _requests
+
+        qr_key = str(request.args.get("qrcode_key", "")).strip()
+        if not qr_key:
+            return jsonify({"error": "缺少 qrcode_key"}), 400
+        try:
+            resp = _requests.get(
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+                params={"qrcode_key": qr_key},
+                headers=_BILIBILI_PASSPORT_HEADERS, timeout=15,
+            )
+            payload = resp.json()
+        except Exception as exc:
+            return jsonify({"error": f"请求 B 站轮询接口失败：{exc}"}), 502
+        data = payload.get("data") or {}
+        state_code = int(data.get("code") or payload.get("code") or 0)
+        # 86101 未扫码；86090 已扫待确认；86038 二维码过期；0 登录成功
+        state = {86101: "waiting", 86090: "scanned", 86038: "expired"}.get(state_code, "confirmed" if state_code == 0 else "expired")
+
+        if state != "confirmed":
+            return jsonify({"state": state})
+
+        cookie_str = "; ".join(
+            f"{c.name}={c.value}" for c in resp.cookies
+        )
+        if not cookie_str:
+            return jsonify({"error": "登录成功但未取到 Cookie，请重试"}), 502
+
+        # 顺带取昵称展示（失败不影响登录结果）
+        nickname = ""
+        try:
+            nav = _requests.get(
+                "https://api.bilibili.com/x/web-interface/nav",
+                headers={**_BILIBILI_PASSPORT_HEADERS, "Cookie": cookie_str}, timeout=15,
+            )
+            nickname = str((nav.json().get("data") or {}).get("uname") or "")
+        except Exception:
+            pass
+
+        user = auth.current_user()
+        settings = dict(user["settings"] or {})
+        settings["bilibili_cookie"] = cookie_str
+        _db.update_user(user["id"], settings=settings)
+        return jsonify({"state": "confirmed", "nickname": nickname})
 
     # ------------------------------------------------------------------
     # Admin

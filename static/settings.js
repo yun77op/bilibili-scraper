@@ -1,5 +1,5 @@
 // 设置页入口（ESM）：配置加载/保存、Notion OAuth、YouTube 登录、管理员区
-import { createApp, ref, computed, onMounted } from "/static/vendor/vue/vue.esm-browser.prod.js";
+import { createApp, ref, computed, onMounted, nextTick } from "/static/vendor/vue/vue.esm-browser.prod.js";
 import { api, Navbar } from "/static/common.js";
 
 const App = {
@@ -68,6 +68,7 @@ const App = {
       dateSubdir.value = Boolean(s.date_subdir);
       updateNotionStatus(cfg.notion_configured, cfg.notion_workspace, cfg.notion_oauth_ready);
       youtubeCookieStatusText.value = s.youtube_cookie_configured ? "已配置" : "未配置";
+      bilibiliCookieStatusText.value = s.bilibili_cookie_configured ? "已配置 ✓" : "未配置";
       await loadNotionPages();
 
       // 管理员区块
@@ -225,6 +226,102 @@ const App = {
       youtubeBusy.value = false;
     }
 
+    // ── Bilibili 扫码登录（二维码 + 轮询，过期自动刷新，总时长 3 分钟）──
+    const bilibiliCookieStatusText = ref("未配置");
+    const bilibiliQrStatusText = ref("");
+    const bilibiliQrBtnText = ref("扫码登录");
+    const bilibiliBusy = ref(false);
+    const bilibiliQrVisible = ref(false);
+    let bilibiliQrAbort = null;
+
+    function bilibiliQrStop() {
+      if (bilibiliQrAbort) {
+        bilibiliQrAbort.cancelled = true;
+        bilibiliQrAbort = null;
+      }
+      bilibiliQrVisible.value = false;
+      bilibiliQrBtnText.value = "扫码登录";
+    }
+
+    function bilibiliQrRender(qrUrl) {
+      const box = document.getElementById("bilibili-qr-box");
+      if (!box) return;
+      box.innerHTML = "";
+      new window.QRCode(box, {
+        text: qrUrl,
+        width: 200,
+        height: 200,
+        correctLevel: window.QRCode.CorrectLevel.M,
+      });
+    }
+
+    async function bilibiliQrStart() {
+      if (bilibiliBusy.value) return;
+      if (bilibiliQrAbort) {
+        // 正在扫码时再点一次 = 取消
+        bilibiliQrStop();
+        bilibiliQrStatusText.value = "";
+        return;
+      }
+      bilibiliBusy.value = true;
+      const session = { cancelled: false };
+      bilibiliQrAbort = session;
+      bilibiliQrVisible.value = true;
+      bilibiliQrBtnText.value = "取消";
+      const deadline = Date.now() + 180_000;
+
+      try {
+        while (!session.cancelled && Date.now() < deadline) {
+          const startResp = await api("/api/bilibili/qr/start", { method: "POST" });
+          const startData = await startResp.json();
+          if (startData.error) {
+            bilibiliQrStatusText.value = "失败: " + startData.error;
+            break;
+          }
+          await nextTick();
+          bilibiliQrRender(startData.qr_url);
+          bilibiliQrStatusText.value = "等待扫码…";
+
+          let refreshed = false;
+          while (!session.cancelled && Date.now() < deadline) {
+            const pollResp = await api(`/api/bilibili/qr/poll?qrcode_key=${encodeURIComponent(startData.qrcode_key)}`);
+            const pollData = await pollResp.json();
+            if (pollData.error) {
+              bilibiliQrStatusText.value = "失败: " + pollData.error;
+              session.cancelled = true;
+              break;
+            }
+            if (pollData.state === "confirmed") {
+              bilibiliCookieStatusText.value = "已配置 ✓" + (pollData.nickname ? `（${pollData.nickname}）` : "");
+              bilibiliQrStatusText.value = "登录成功，Cookie 已保存 ✓";
+              session.cancelled = true;
+              break;
+            }
+            if (pollData.state === "scanned") {
+              bilibiliQrStatusText.value = "已扫码，请在手机上确认…";
+            } else if (pollData.state === "expired") {
+              refreshed = true;
+              break; // 重新生成二维码
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+          if (refreshed) bilibiliQrStatusText.value = "二维码已过期，正在刷新…";
+        }
+      } catch (err) {
+        bilibiliQrStatusText.value = "请求失败: " + err.message;
+      }
+
+      bilibiliBusy.value = false;
+      if (bilibiliQrAbort === session) {
+        bilibiliQrAbort = null;
+        bilibiliQrVisible.value = false;
+        bilibiliQrBtnText.value = "扫码登录";
+        if (bilibiliQrStatusText.value === "等待扫码…" || bilibiliQrStatusText.value === "二维码已过期，正在刷新…") {
+          bilibiliQrStatusText.value = "";
+        }
+      }
+    }
+
     // ── 管理员：用户管理 ──
     async function loadUsers() {
       try {
@@ -259,6 +356,7 @@ const App = {
       notionPages, notionPagePlaceholder,
       notionAuth, disconnect,
       youtubeCookieStatusText, youtubeLoginStatusText, youtubeBusy, youtubeLogin,
+      bilibiliCookieStatusText, bilibiliQrStatusText, bilibiliQrBtnText, bilibiliBusy, bilibiliQrVisible, bilibiliQrStart,
       isAdmin, serverInfo, users, fmtDate, toggleUser,
       save,
     };
